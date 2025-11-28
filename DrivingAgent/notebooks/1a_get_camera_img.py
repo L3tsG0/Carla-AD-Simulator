@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import argparse
 import carla
 import time
 from pathlib import Path
@@ -14,25 +17,37 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / "config" / ".env"
 CONFIG = EnvConfig(ENV_PATH)
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Capture camera images in CARLA")
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=None,
+        help="Recording duration in seconds (overrides env RECORD_SECONDS)",
+    )
+    return parser.parse_args()
+
+
+def main(record_seconds: float | None = None):
     # 保存先ディレクトリの作成
     output_dir = Path(CONFIG.get("OUTPUT_DIR", BASE_DIR / "nuscenes_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. クライアントの初期化とサーバへの接続
+    actor_list: list[carla.Actor] = []
+    camera_rig: NuScenesCameraRig | None = None
     try:
         carla_host = CONFIG.get("CARLA_HOST", "localhost")
         carla_port = CONFIG.get_int("CARLA_PORT", 2000)
         carla_timeout = CONFIG.get_float("CARLA_TIMEOUT", 10.0)
         carla_town = CONFIG.get("CARLA_TOWN", "Town04")
+        duration = record_seconds
+        if duration is None:
+            duration = CONFIG.get_float("RECORD_SECONDS", 10.0)
 
         client = carla.Client(carla_host, carla_port)
         client.set_timeout(carla_timeout)
         world = client.load_world(carla_town) if carla_town else client.get_world()
-        
-        # 既存のActorをクリーンアップするためのリスト
-        actor_list = []
-        camera_rig: NuScenesCameraRig | None = None
         
         # ブループリントライブラリの取得
         blueprint_library = world.get_blueprint_library()
@@ -56,11 +71,11 @@ def main():
         camera_rig = NuScenesCameraRig(world, output_dir)
         camera_rig.spawn(vehicle)
 
-        print("データ収集を開始します (10秒間)...")
+        print(f"データ収集を開始します ({duration:.1f}秒間)...")
         
         # 6. シミュレーションループ
         # クライアント側で時間を進める（非同期モードの場合はwaitのみ）
-        time.sleep(10)
+        time.sleep(duration)
     finally:
         # 7. クリーンアップ
         print("終了処理中: 生成したActorを破棄します...")
@@ -72,8 +87,9 @@ def main():
         print("完了")
 
 if __name__ == '__main__':
+    args = parse_args()
     try:
-        main()
+        main(record_seconds=args.record_seconds)
     except KeyboardInterrupt:
         print("\nCancelled by user. Bye!")
     except RuntimeError as e:

@@ -47,3 +47,16 @@ class EnvConfig:
             return float(value)
         except ValueError:
             return default
+
+    def get_bool(self, key: str, default: bool) -> bool:
+        value = self.get(key, None)
+        if value is None:
+            return default
+        true_values = {"1", "true", "on", "yes"}
+        false_values = {"0", "false", "off", "no"}
+        lower = value.lower()
+        if lower in true_values:
+            return True
+        if lower in false_values:
+            return False
+        return default
