@@ -1,4 +1,8 @@
 .env
 *.png
+*.jpg
+*.json
+*.npy
+*.pkl
 *.pyc
 __pychache__
