@@ -16,6 +16,14 @@ class CameraConfig:
     transform: carla.Transform
 
 
+@dataclass
+class CameraInstance:
+    """Concrete sensor instance with its configuration."""
+
+    config: CameraConfig
+    sensor: carla.Sensor
+
+
 class NuScenesCameraRig:
     """Camera rig that mimics nuScenes 6-camera setup."""
 
@@ -98,11 +106,11 @@ class NuScenesCameraRig:
             ),
         ]
 
-    def spawn(self, vehicle: carla.Vehicle) -> List[carla.Sensor]:
+    def spawn(self, vehicle: carla.Vehicle) -> List[CameraInstance]:
         """Spawn cameras and start recording images."""
 
         dist_to_rear_axle = self._rear_axle_offset(vehicle)
-        sensors: List[carla.Sensor] = []
+        instances: List[CameraInstance] = []
 
         for config in self._camera_configs(dist_to_rear_axle):
             save_dir = self._output_dir / config.name
@@ -117,10 +125,10 @@ class NuScenesCameraRig:
                     str(path / f"{image.frame}.png")
                 )
             )
-            sensors.append(sensor)
+            instances.append(CameraInstance(config=config, sensor=sensor))
 
-        self._sensors.extend(sensors)
-        return sensors
+        self._sensors.extend(instance.sensor for instance in instances)
+        return instances
 
     def destroy(self) -> None:
         """Destroy spawned sensors."""
