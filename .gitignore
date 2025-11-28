@@ -1,0 +1,4 @@
+.env
+*.png
+*.pyc
+__pychache__
