@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import pickle
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import carla
 import uuid
@@ -33,6 +34,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-seconds", type=float, default=1.0)
     parser.add_argument("--output", type=Path, default=None, help="Path to write JSON payload")
     parser.add_argument("--pkl-output", type=Path, default=None, help="Path to write PKL payload")
+    parser.add_argument(
+        "--template-info",
+        type=Path,
+        default=None,
+        help="Optional nuScenes infos .pkl to use for filling missing metadata",
+    )
+    parser.add_argument(
+        "--template-index",
+        type=int,
+        default=0,
+        help="Index of the nuScenes sample to take as template when --template-info is set",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +59,7 @@ class OpenOccPayloadBuilder:
     def __init__(self, base_dir: Path, config: EnvConfig) -> None:
         self.base_dir = base_dir
         self.config = config
+        self.payload_path_prefix = self.config.get("PAYLOAD_PATH_PREFIX", None)
 
     @staticmethod
     def _euler_deg_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> List[float]:
@@ -100,33 +114,89 @@ class OpenOccPayloadBuilder:
 
     @staticmethod
     def _ensure_rgb(image_path: Path) -> Path:
+        """Convert images to RGB JPEG and remove the original PNG."""
         try:
             img = Image.open(image_path)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-                target = image_path.with_name(image_path.stem + "_rgb.jpg")
-                img.save(target, format="JPEG")
-                return target.resolve()
         except OSError:
-            # broken PNG, fall back to original path
             return image_path
-        return image_path
+
+        target = image_path.with_suffix(".jpg")
+        if image_path.suffix.lower() != ".jpg" or target != image_path:
+            img.save(target, format="JPEG")
+            try:
+                image_path.unlink()
+            except FileNotFoundError:
+                pass
+            return target.resolve()
+
+        img.save(target, format="JPEG")
+        return target.resolve()
+
+    def _format_data_path(self, path: Path) -> str:
+        """Return a payload-friendly path (relative to base_dir with optional prefix)."""
+        try:
+            rel = path.relative_to(self.base_dir)
+        except ValueError:
+            return str(path)
+        if self.payload_path_prefix:
+            return str(Path(self.payload_path_prefix) / rel).replace("\\", "/")
+        return str(rel).replace("\\", "/")
+
+    @staticmethod
+    def _pose_to_matrix(pose: Dict[str, List[float]]) -> np.ndarray:
+        rotation = np.array(OpenOccPayloadBuilder._quat_to_rot_matrix(pose["rotation"]))
+        translation = np.array(pose["translation"])
+        matrix = np.eye(4)
+        matrix[:3, :3] = rotation
+        matrix[:3, 3] = translation
+        return matrix
+
+    @staticmethod
+    def _lidar_transform(dist_to_rear_axle: float) -> carla.Transform:
+        """Approximate nuScenes LiDAR mount on CARLA vehicle."""
+        location = carla.Location(x=1.35 - dist_to_rear_axle, y=0.0, z=1.73)
+        rotation = carla.Rotation(roll=0.0, pitch=0.0, yaw=0.0)
+        return carla.Transform(location, rotation)
+
+    @staticmethod
+    def _quaternion_yaw(quat: List[float]) -> float:
+        w, x, y, z = quat
+        siny = 2.0 * (w * z + x * y)
+        cosy = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny, cosy)
+
+    def _build_can_bus(self, ego_pose: Dict[str, List[float]]) -> List[float]:
+        can_bus = [0.0] * 18
+        can_bus[:3] = ego_pose["translation"]
+        can_bus[3:7] = ego_pose["rotation"]
+        yaw_deg = math.degrees(self._quaternion_yaw(ego_pose["rotation"]))
+        if yaw_deg < 0:
+            yaw_deg += 360.0
+        can_bus[-2] = math.radians(yaw_deg)
+        can_bus[-1] = yaw_deg
+        return can_bus
 
     def _build_cam_entry(
         self,
         instance: CameraInstance,
         ego_pose: Dict[str, List[float]],
         image_path: Path,
+        lidar_pose_matrix: np.ndarray,
     ) -> Dict[str, Any]:
         extrinsic = self._transform_to_pose(instance.config.transform)
-        sensor2lidar_rot = self._quat_to_rot_matrix(extrinsic["rotation"])
+        sensor_matrix = self._pose_to_matrix(extrinsic)
+        sensor2lidar = np.linalg.inv(lidar_pose_matrix) @ sensor_matrix
+        sensor2lidar_rot = sensor2lidar[:3, :3]
+        sensor2lidar_trans = sensor2lidar[:3, 3]
         entry: Dict[str, Any] = {
-            "data_path": str(image_path),
+            "data_path": self._format_data_path(image_path),
             "type": "camera",
             "sensor2ego_translation": extrinsic["translation"],
             "sensor2ego_rotation": extrinsic["rotation"],
-            "sensor2lidar_translation": [0.0, 0.0, 0.0],
-            "sensor2lidar_rotation": sensor2lidar_rot,
+            "sensor2lidar_translation": sensor2lidar_trans.tolist(),
+            "sensor2lidar_rotation": sensor2lidar_rot.tolist(),
             "ego2global_translation": ego_pose["translation"],
             "ego2global_rotation": ego_pose["rotation"],
             "timestamp": int(time.time() * 1e6),
@@ -146,7 +216,40 @@ class OpenOccPayloadBuilder:
         }
         return entry
 
-    def build_payload(self, spawn_index: int, record_seconds: float) -> Dict[str, Any]:
+    @staticmethod
+    def _needs_template_value(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value == ""
+        if isinstance(value, (list, tuple, dict)):
+            return len(value) == 0
+        return False
+
+    def _merge_with_template(self, info: Dict[str, Any], template: Dict[str, Any]) -> Dict[str, Any]:
+        merged = copy.deepcopy(info)
+        template_fields = [
+            "lidar_path",
+            "lidar_token",
+            "sweeps",
+            "lidarseg",
+            "prev",
+            "next",
+            "occ_size",
+            "pc_range",
+        ]
+        for key in template_fields:
+            if key not in merged or self._needs_template_value(merged[key]):
+                if key in template:
+                    merged[key] = copy.deepcopy(template[key])
+        return merged
+
+    def build_payload(
+        self,
+        spawn_index: int,
+        record_seconds: float,
+        template_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         carla_host = self.config.get("CARLA_HOST", "localhost")
         carla_port = self.config.get_int("CARLA_PORT", 2000)
         carla_timeout = self.config.get_float("CARLA_TIMEOUT", 10.0)
@@ -170,23 +273,27 @@ class OpenOccPayloadBuilder:
 
             output_dir = self.base_dir / "nuscenes_output"
             camera_rig = NuScenesCameraRig(world, output_dir)
+            dist_to_rear_axle = camera_rig._rear_axle_offset(vehicle)  # type: ignore[attr-defined]
             camera_instances = camera_rig.spawn(vehicle)
 
             time.sleep(record_seconds)
 
             ego_pose = self._transform_to_pose(vehicle.get_transform())
+            lidar_transform = self._lidar_transform(dist_to_rear_axle)
+            lidar_pose = self._transform_to_pose(lidar_transform)
+            lidar_matrix = self._pose_to_matrix(lidar_pose)
             cams_dict = {}
             for instance in camera_instances:
                 image_dir = self.base_dir / "nuscenes_output" / instance.config.name
                 image_path = self._ensure_rgb(self._latest_image_path(image_dir))
                 cams_dict[instance.config.name] = self._build_cam_entry(
-                    instance, ego_pose, image_path
+                    instance, ego_pose, image_path, lidar_matrix
                 )
 
             scene_token = f"scene-{uuid.uuid4().hex}"
             sample_token = f"sample-{uuid.uuid4().hex}"
 
-            payload = {
+            payload: Dict[str, Any] = {
                 "infos": [
                     {
                         "token": sample_token,
@@ -198,17 +305,19 @@ class OpenOccPayloadBuilder:
                         "ego2global_rotation": ego_pose["rotation"],
                         "lidar_path": "",
                         "lidar_token": "",
-                        "lidar2ego_translation": [0, 0, 0],
-                        "lidar2ego_rotation": [1, 0, 0, 0],
+                        "lidar2ego_translation": lidar_pose["translation"],
+                        "lidar2ego_rotation": lidar_pose["rotation"],
                         "lidarseg": "",
                         "prev": "",
                         "next": "",
                         "sweeps": [],
-                        "can_bus": [],
+                        "can_bus": self._build_can_bus(ego_pose),
                     }
                 ],
                 "metadata": {"version": "carla"},
             }
+            if template_info is not None:
+                payload["infos"][0] = self._merge_with_template(payload["infos"][0], template_info)
             return payload
         finally:
             if camera_rig:
@@ -229,10 +338,27 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
+def load_template_info(path: Path, index: int) -> Dict[str, Any]:
+    with path.open("rb") as f:
+        data = pickle.load(f)
+    if isinstance(data, dict) and "infos" in data:
+        infos = data["infos"]
+    elif isinstance(data, list):
+        infos = data
+    else:
+        raise ValueError(f"Unsupported template format in {path}")
+    if not 0 <= index < len(infos):
+        raise IndexError(f"template index {index} out of range (len={len(infos)})")
+    return copy.deepcopy(infos[index])
+
+
 def main() -> None:
     args = parse_args()
     builder = OpenOccPayloadBuilder(BASE_DIR, CONFIG)
-    payload = builder.build_payload(args.spawn_index, args.record_seconds)
+    template_info = None
+    if args.template_info:
+        template_info = load_template_info(args.template_info, args.template_index)
+    payload = builder.build_payload(args.spawn_index, args.record_seconds, template_info=template_info)
 
     wrapped = {"payload": payload}
     payload_json = json.dumps(wrapped, indent=2, default=_json_default)
