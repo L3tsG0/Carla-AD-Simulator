@@ -1,7 +1,10 @@
 import argparse
+import importlib.util
 import pickle
+import shutil
+import sys
 from pathlib import Path
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 
 import cv2
 
@@ -16,6 +19,7 @@ CAMERAS = [
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_TMP_DIR = SCRIPT_DIR / "tmp"
+DRIVING_AGENT_ROOT = SCRIPT_DIR.parents[1]
 
 PATH_MAPPINGS = [
     (Path("/home/tsuruoka/hdd/BEV"), Path("/workspace")),
@@ -128,6 +132,41 @@ def convert_to_container_path(path: Path) -> Path:
     return original
 
 
+def convert_to_host_path(path: Path, base_dir: Optional[Path] = None) -> Path:
+    path_obj = Path(path)
+    if not path_obj.is_absolute() and base_dir is not None:
+        candidate = (base_dir / path_obj).resolve()
+        if candidate.exists():
+            return candidate
+
+    path_str = path_obj.as_posix()
+    resolved_str = path_obj.resolve().as_posix() if path_obj.exists() else path_str
+
+    for host_root, container_root in PATH_MAPPINGS:
+        container_prefix = container_root.as_posix()
+        host_prefix = host_root.as_posix()
+
+        if path_str.startswith(container_prefix):
+            suffix = path_str[len(container_prefix):]
+            candidate = Path(host_prefix + suffix)
+            if candidate.exists():
+                return candidate.resolve()
+
+        if resolved_str.startswith(container_prefix):
+            suffix = resolved_str[len(container_prefix):]
+            candidate = Path(host_prefix + suffix)
+            if candidate.exists():
+                return candidate.resolve()
+
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+
+    if base_dir is not None:
+        return (base_dir / path_obj).resolve()
+
+    return path_obj.resolve()
+
+
 def update_pkl(template_pkl: Path, output_pkl: Path, image_paths: Dict[str, Dict[str, Path]]) -> None:
     with open(template_pkl, "rb") as f:
         data = pickle.load(f)
@@ -140,15 +179,61 @@ def update_pkl(template_pkl: Path, output_pkl: Path, image_paths: Dict[str, Dict
         pickle.dump(data, f)
 
 
+def _load_payload_builder():
+    module_path = SCRIPT_DIR / "2b_build_openocc_payload.py"
+    spec = importlib.util.spec_from_file_location("openocc_payload_builder", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load payload builder from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["openocc_payload_builder"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def capture_with_carla(
+    template_pkl: Path,
+    template_index: int,
+    spawn_index: int,
+    record_seconds: float,
+) -> Tuple[Dict[str, Any], Path]:
+    module = _load_payload_builder()
+    builder = module.OpenOccPayloadBuilder(module.BASE_DIR, module.CONFIG)
+    template_info = module.load_template_info(template_pkl, template_index)
+    payload = builder.build_payload(spawn_index, record_seconds, template_info=template_info)
+    return payload, builder.base_dir
+
+
+def copy_payload_images(payload: Dict[str, Any], dest_dir: Path, base_dir: Path) -> Dict[str, Dict[str, Path]]:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    results: Dict[str, Dict[str, Path]] = {}
+    sample = payload["infos"][0]
+    for cam, entry in sample["cams"].items():
+        src = convert_to_host_path(Path(entry["data_path"]), base_dir)
+        if not src.exists():
+            raise FileNotFoundError(f"Camera image not found: {src}")
+        dest = dest_dir / f"{cam}.jpg"
+        shutil.copy2(src, dest)
+        host_path = dest.resolve()
+        container_path = convert_to_container_path(host_path)
+        results[cam] = {"host": host_path, "container": container_path}
+    return results
+
+
+def save_payload(payload: Dict[str, Any], output_pkl: Path) -> None:
+    with output_pkl.open("wb") as f:
+        pickle.dump(payload, f)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert Carla single frame into OpenOccupancy PKL."
     )
     parser.add_argument(
         "--carla-dir",
-        required=True,
         type=Path,
-        help="Directory containing Carla camera images for a single frame.",
+        default=None,
+        help="Directory containing Carla camera images for manual mode. "
+        "If omitted, images will be captured from a running CARLA simulator.",
     )
     parser.add_argument(
         "--template-pkl",
@@ -183,22 +268,54 @@ def parse_args() -> argparse.Namespace:
             " {cam_short}, {frame}). Example: 'frames/{frame}/{cam}.png'"
         ),
     )
+    parser.add_argument(
+        "--template-index",
+        type=int,
+        default=0,
+        help="Index of the template sample to use when loading template-pkl "
+        "and when merging metadata for CARLA captures.",
+    )
+    parser.add_argument(
+        "--spawn-index",
+        type=int,
+        default=361,
+        help="CARLA spawn index to use when capturing a frame (ignored in manual mode).",
+    )
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=1.0,
+        help="How long to wait after spawning sensors before capturing images.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    carla_dir = args.carla_dir
-    if not carla_dir.exists():
-        raise FileNotFoundError(f"Directory not found: {carla_dir}")
+    if args.carla_dir:
+        if not args.carla_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {args.carla_dir}")
+        camera_images = find_camera_images(args.carla_dir, args.frame_id, args.filename_template)
+        saved_paths = convert_and_save(camera_images, args.output_image_dir)
+        update_pkl(args.template_pkl, args.output_pkl, saved_paths)
 
-    camera_images = find_camera_images(carla_dir, args.frame_id, args.filename_template)
-    saved_paths = convert_and_save(camera_images, args.output_image_dir)
-    update_pkl(args.template_pkl, args.output_pkl, saved_paths)
+        print("Generated:", args.output_pkl)
+        for cam, paths in saved_paths.items():
+            print(f"{cam}: host={paths['host']} container={paths['container']}")
+    else:
+        payload, base_dir = capture_with_carla(
+            args.template_pkl,
+            args.template_index,
+            args.spawn_index,
+            args.record_seconds,
+        )
+        host_base = base_dir if base_dir is not None else DRIVING_AGENT_ROOT
+        saved_paths = copy_payload_images(payload, args.output_image_dir, host_base)
+        update_pkl(args.template_pkl, args.output_pkl, saved_paths)
 
-    print("Generated:", args.output_pkl)
-    for cam, paths in saved_paths.items():
-        print(f"{cam}: host={paths['host']} container={paths['container']}")
+        print(f"Generated: {args.output_pkl}")
+        for cam, paths in saved_paths.items():
+            print(f"{cam}: host={paths['host']} container={paths['container']}")
 
 
 if __name__ == "__main__":
