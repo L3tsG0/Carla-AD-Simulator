@@ -13,11 +13,18 @@ import carla
 class _ImageSaveWorker:
     """Background worker that writes CARLA images to disk."""
 
-    def __init__(self, max_queue: int = 512) -> None:
+    def __init__(self, max_queue: int = 4096, num_workers: int = 4) -> None:
         self._queue: "queue.Queue[tuple[carla.Image, str]]" = queue.Queue(max_queue)
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._threads: list[threading.Thread] = []
+        for idx in range(max(1, num_workers)):
+            thread = threading.Thread(
+                target=self._run,
+                name=f"camera-save-{idx}",
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
 
     def enqueue(self, image: carla.Image, path: Path) -> None:
         try:
@@ -28,13 +35,16 @@ class _ImageSaveWorker:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
         self._queue.join()
-        self._thread.join(timeout=timeout)
+        for thread in self._threads:
+            thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
+        while True:
             try:
                 image, path = self._queue.get(timeout=0.1)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    break
                 continue
             try:
                 image.save_to_disk(path)
@@ -68,14 +78,15 @@ class NuScenesCameraRig:
         world: carla.World,
         output_dir: Path,
         sensor_tick: float = 0.5,
-        save_queue_size: int = 512,
+        save_queue_size: int = 4096,
+        save_worker_count: int = 4,
     ) -> None:
         self._world = world
         self._output_dir = Path(output_dir)
         self._sensor_tick = sensor_tick
         self._camera_bp = self._create_camera_blueprint()
         self._sensors: List[carla.Sensor] = []
-        self._save_worker = _ImageSaveWorker(max_queue=save_queue_size)
+        self._save_worker = _ImageSaveWorker(max_queue=save_queue_size, num_workers=save_worker_count)
 
     def _create_camera_blueprint(self) -> carla.ActorBlueprint:
         blueprint = self._world.get_blueprint_library().find("sensor.camera.rgb")

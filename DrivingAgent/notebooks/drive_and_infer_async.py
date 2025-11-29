@@ -190,6 +190,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stabilization-seconds", type=float, default=5.0)
     parser.add_argument("--sensor-warmup-seconds", type=float, default=1.0)
     parser.add_argument("--tick-timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--camera-save-queue-size", type=int, default=4096, help="Queue length for background image saving.")
+    parser.add_argument("--camera-save-workers", type=int, default=4, help="Number of background threads writing images to disk.")
     parser.add_argument("--traffic-manager-port", type=int, default=None)
     parser.add_argument("--driver-debug", action="store_true")
     parser.add_argument("--max-pending-frames", type=int, default=8, help="Max number of queued frames awaiting inference.")
@@ -222,6 +224,8 @@ def main() -> None:
         tick_timeout_seconds=args.tick_timeout_seconds,
         traffic_manager_port=args.traffic_manager_port,
         debug=args.driver_debug,
+        camera_save_queue_size=args.camera_save_queue_size,
+        camera_save_workers=args.camera_save_workers,
     )
 
     notebooks_dir = Path(__file__).resolve().parent

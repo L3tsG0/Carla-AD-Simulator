@@ -38,6 +38,8 @@ class DriverConfig:
     tick_timeout_seconds: float = 10.0
     traffic_manager_port: Optional[int] = None
     debug: bool = False
+    camera_save_queue_size: int = 4096
+    camera_save_workers: int = 4
 
 
 class StraightLineDriver:
@@ -187,7 +189,11 @@ class StraightLineDriver:
             self._wait_with_world(self.cfg.stabilization_seconds, apply_brake=True)
             if self.cfg.enable_cameras:
                 self.camera_rig = NuScenesCameraRig(
-                    self.world, output_dir, sensor_tick=self.cfg.fixed_delta_seconds
+                    self.world,
+                    output_dir,
+                    sensor_tick=self.cfg.fixed_delta_seconds,
+                    save_queue_size=self.cfg.camera_save_queue_size,
+                    save_worker_count=self.cfg.camera_save_workers,
                 )
                 self.camera_rig.spawn(self.vehicle)
                 self._debug("Cameras spawned")
@@ -244,6 +250,8 @@ def parse_args() -> DriverConfig:
     parser.add_argument("--tick-timeout-seconds", type=float, default=10.0)
     parser.add_argument("--traffic-manager-port", type=int, default=None)
     parser.add_argument("--driver-debug", action="store_true")
+    parser.add_argument("--camera-save-queue-size", type=int, default=4096)
+    parser.add_argument("--camera-save-workers", type=int, default=4)
 
     args = parser.parse_args()
     return DriverConfig(
@@ -263,6 +271,8 @@ def parse_args() -> DriverConfig:
         tick_timeout_seconds=args.tick_timeout_seconds,
         traffic_manager_port=args.traffic_manager_port,
         debug=args.driver_debug,
+        camera_save_queue_size=args.camera_save_queue_size,
+        camera_save_workers=args.camera_save_workers,
     )
 
 
