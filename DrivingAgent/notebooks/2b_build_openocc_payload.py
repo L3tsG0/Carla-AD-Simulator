@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build nuScenes-like payload for OpenOccupancy")
     parser.add_argument("--spawn-index", type=int, default=361)
     parser.add_argument("--record-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--post-capture-wait",
+        type=float,
+        default=0.5,
+        help="Extra wait time after recording to ensure sensors finish writing images.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Path to write JSON payload")
     parser.add_argument("--pkl-output", type=Path, default=None, help="Path to write PKL payload")
     parser.add_argument(
@@ -103,14 +109,24 @@ class OpenOccPayloadBuilder:
     @staticmethod
     def _latest_image_path(directory: Path) -> Path:
         images = sorted(directory.glob("*.png"), reverse=True)
+        valid: List[Path] = []
         for image in images:
             try:
                 with Image.open(image) as img:
                     img.verify()
-                return image.resolve()
+                    width, height = img.size
+                    if width <= 0 or height <= 0:
+                        continue
+                valid.append(image.resolve())
             except Exception:
                 continue
-        raise FileNotFoundError(f"No valid images found in {directory}")
+            if len(valid) >= 2:
+                break
+        if not valid:
+            raise FileNotFoundError(f"No valid images found in {directory}")
+        if len(valid) >= 2:
+            return valid[1]
+        return valid[0]
 
     @staticmethod
     def _ensure_rgb(image_path: Path) -> Path:
@@ -249,6 +265,7 @@ class OpenOccPayloadBuilder:
         spawn_index: int,
         record_seconds: float,
         template_info: Optional[Dict[str, Any]] = None,
+        post_capture_wait: float = 0.5,
     ) -> Dict[str, Any]:
         carla_host = self.config.get("CARLA_HOST", "localhost")
         carla_port = self.config.get_int("CARLA_PORT", 2000)
@@ -277,6 +294,8 @@ class OpenOccPayloadBuilder:
             camera_instances = camera_rig.spawn(vehicle)
 
             time.sleep(record_seconds)
+            if post_capture_wait > 0:
+                time.sleep(post_capture_wait)
 
             ego_pose = self._transform_to_pose(vehicle.get_transform())
             lidar_transform = self._lidar_transform(dist_to_rear_axle)
@@ -358,7 +377,12 @@ def main() -> None:
     template_info = None
     if args.template_info:
         template_info = load_template_info(args.template_info, args.template_index)
-    payload = builder.build_payload(args.spawn_index, args.record_seconds, template_info=template_info)
+    payload = builder.build_payload(
+        args.spawn_index,
+        args.record_seconds,
+        template_info=template_info,
+        post_capture_wait=args.post_capture_wait,
+    )
 
     wrapped = {"payload": payload}
     payload_json = json.dumps(wrapped, indent=2, default=_json_default)

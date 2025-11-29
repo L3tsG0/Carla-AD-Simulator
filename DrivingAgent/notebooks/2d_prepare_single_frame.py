@@ -195,11 +195,17 @@ def capture_with_carla(
     template_index: int,
     spawn_index: int,
     record_seconds: float,
+    post_capture_wait: float,
 ) -> Tuple[Dict[str, Any], Path]:
     module = _load_payload_builder()
     builder = module.OpenOccPayloadBuilder(module.BASE_DIR, module.CONFIG)
     template_info = module.load_template_info(template_pkl, template_index)
-    payload = builder.build_payload(spawn_index, record_seconds, template_info=template_info)
+    payload = builder.build_payload(
+        spawn_index,
+        record_seconds,
+        template_info=template_info,
+        post_capture_wait=post_capture_wait,
+    )
     return payload, builder.base_dir
 
 
@@ -287,6 +293,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="How long to wait after spawning sensors before capturing images.",
     )
+    parser.add_argument(
+        "--post-capture-wait",
+        type=float,
+        default=0.5,
+        help="Additional wait time after recording to allow sensors to flush frames.",
+    )
     return parser.parse_args()
 
 
@@ -308,6 +320,7 @@ def main() -> None:
             args.template_index,
             args.spawn_index,
             args.record_seconds,
+            args.post_capture_wait,
         )
         host_base = base_dir if base_dir is not None else DRIVING_AGENT_ROOT
         saved_paths = copy_payload_images(payload, args.output_image_dir, host_base)
