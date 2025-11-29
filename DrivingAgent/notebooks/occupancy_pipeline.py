@@ -15,10 +15,10 @@ import requests
 @dataclass
 class PipelineResult:
     payload_path: Path
-    prediction_dense_path: Path
-    costmap_full_path: Path
-    costmap_window_path: Path
-    costmap_image_path: Path
+    prediction_dense_path: Optional[Path] = None
+    costmap_full_path: Optional[Path] = None
+    costmap_window_path: Optional[Path] = None
+    costmap_image_path: Optional[Path] = None
     occ_size: Optional[List[int]] = None
     pc_range: Optional[List[float]] = None
 
@@ -70,20 +70,46 @@ class OccupancyCostmapPipeline:
         spawn_index: int,
         record_seconds: float,
         output_pkl: Optional[Path] = None,
+        carla_dir: Optional[Path] = None,
+        frame_id: Optional[str] = None,
+        filename_template: Optional[str] = None,
     ) -> Path:
         output_pkl = output_pkl or self.tmp_dir / f"carla_capture_{int(time.time())}.pkl"
         args = [
             self.python_exec,
             str(self.capture_script),
-            "--spawn-index",
-            str(spawn_index),
-            "--record-seconds",
-            str(record_seconds),
-            "--post-capture-wait",
-            str(self.post_capture_wait),
-            "--output-pkl",
-            str(output_pkl),
         ]
+        if carla_dir:
+            image_dir = self.tmp_dir / f"manual_images_{int(time.time())}"
+            args.extend(
+                [
+                    "--carla-dir",
+                    str(carla_dir),
+                    "--output-image-dir",
+                    str(image_dir),
+                ]
+            )
+            if frame_id:
+                args.extend(["--frame-id", frame_id])
+            if filename_template:
+                args.extend(["--filename-template", filename_template])
+        else:
+            args.extend(
+                [
+                    "--spawn-index",
+                    str(spawn_index),
+                    "--record-seconds",
+                    str(record_seconds),
+                    "--post-capture-wait",
+                    str(self.post_capture_wait),
+                ]
+            )
+        args.extend(
+            [
+                "--output-pkl",
+                str(output_pkl),
+            ]
+        )
         self._run_subprocess(args)
         return output_pkl
 
@@ -174,8 +200,20 @@ class OccupancyCostmapPipeline:
         rotate_degrees: int = 0,
         align_carla_y: bool = False,
         recenter_mode: str = "bbox",
+        carla_dir: Optional[Path] = None,
+        frame_id: Optional[str] = None,
+        filename_template: Optional[str] = None,
+        enable_inference: bool = True,
     ) -> PipelineResult:
-        payload = self.capture_frame(spawn_index=spawn_index, record_seconds=record_seconds)
+        payload = self.capture_frame(
+            spawn_index=spawn_index,
+            record_seconds=record_seconds,
+            carla_dir=carla_dir,
+            frame_id=frame_id,
+            filename_template=filename_template,
+        )
+        if not enable_inference:
+            return PipelineResult(payload_path=payload)
         prediction, occ_size, pc_range = self.request_inference(payload)
         return self.build_costmap(
             prediction_path=prediction,
@@ -207,6 +245,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--workspace-root", type=Path, default=None)
     parser.add_argument("--post-capture-wait", type=float, default=0.5)
+    parser.add_argument(
+        "--carla-dir",
+        type=Path,
+        default=None,
+        help="Use existing CARLA image directory instead of capturing a new frame.",
+    )
+    parser.add_argument(
+        "--frame-id",
+        type=str,
+        default=None,
+        help="Frame identifier to substitute into filename templates when using --carla-dir.",
+    )
+    parser.add_argument(
+        "--filename-template",
+        type=str,
+        default=None,
+        help=(
+            "Template describing relative camera image paths (supports {cam}, {cam_lower}, "
+            "{cam_short}, {frame})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -227,6 +286,9 @@ def main() -> None:
         rotate_degrees=args.rotate_degrees,
         align_carla_y=args.align_carla_y,
         recenter_mode=args.recenter,
+        carla_dir=args.carla_dir,
+        frame_id=args.frame_id,
+        filename_template=args.filename_template,
     )
     print("Payload:", result.payload_path)
     print("Prediction (dense):", result.prediction_dense_path)

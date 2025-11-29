@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any, Tuple
 
 import cv2
+from PIL import Image
 
 CAMERAS = [
     "CAM_FRONT",
@@ -34,6 +35,8 @@ def find_camera_images(
     results = {}
     for cam in CAMERAS:
         candidate = resolve_with_template(base_dir, cam, frame_id, template, exts)
+        if candidate is None:
+            candidate = find_in_subdir(base_dir, cam, exts)
         if candidate is None:
             candidate = search_by_name(base_dir, cam, exts)
         results[cam] = candidate
@@ -93,6 +96,26 @@ def search_by_name(base_dir: Path, cam: str, exts: List[str]) -> Path:
             f"Multiple candidates for {cam}: {', '.join(str(p) for p in unique[:5])}"
         )
     return unique[0]
+
+
+def find_in_subdir(base_dir: Path, cam: str, exts: List[str]) -> Optional[Path]:
+    cam_dir = base_dir / cam
+    if not cam_dir.exists():
+        return None
+    files: List[Path] = []
+    for ext in exts:
+        files.extend(cam_dir.glob(f"*{ext}"))
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for candidate in files:
+        try:
+            with Image.open(candidate) as img:
+                img.verify()
+            return candidate
+        except Exception:
+            continue
+    return None
 
 
 def convert_and_save(images: Dict[str, Path], dest_dir: Path) -> Dict[str, Dict[str, Path]]:

@@ -27,9 +27,10 @@ class CameraInstance:
 class NuScenesCameraRig:
     """Camera rig that mimics nuScenes 6-camera setup."""
 
-    def __init__(self, world: carla.World, output_dir: Path) -> None:
+    def __init__(self, world: carla.World, output_dir: Path, sensor_tick: float = 0.5) -> None:
         self._world = world
         self._output_dir = Path(output_dir)
+        self._sensor_tick = sensor_tick
         self._camera_bp = self._create_camera_blueprint()
         self._sensors: List[carla.Sensor] = []
 
@@ -38,7 +39,7 @@ class NuScenesCameraRig:
         blueprint.set_attribute("image_size_x", "1600")
         blueprint.set_attribute("image_size_y", "900")
         blueprint.set_attribute("fov", "70")
-        blueprint.set_attribute("sensor_tick", "0.5")
+        blueprint.set_attribute("sensor_tick", str(self._sensor_tick))
         return blueprint
 
     def _rear_axle_offset(self, vehicle: carla.Vehicle) -> float:
