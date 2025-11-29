@@ -3,7 +3,7 @@ import json
 import math
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -143,8 +143,12 @@ def shift_costmap(cost: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
     return shifted
 
 
-def recenter_costmap(cost: np.ndarray, mode: str) -> Tuple[np.ndarray, Tuple[int, int]]:
-    """Recenters the cost map so that occupied bbox is aligned to the grid center."""
+def recenter_costmap(
+    cost: np.ndarray,
+    mode: str,
+    config_center: Optional[Tuple[float, float]] = None,
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Recenters the cost map according to the selected mode."""
     if mode == "none":
         return cost.copy(), (0, 0)
 
@@ -159,8 +163,32 @@ def recenter_costmap(cost: np.ndarray, mode: str) -> Tuple[np.ndarray, Tuple[int
         shift = np.round(grid_center - bbox_center).astype(int)
         shifted = shift_costmap(cost, (int(shift[0]), int(shift[1])))
         return shifted, (int(shift[0]), int(shift[1]))
+    if mode == "ego":
+        if config_center is None:
+            return cost.copy(), (0, 0)
+        current_center = (np.array(cost.shape[:2], dtype=np.float64) - 1.0) / 2.0
+        target_center = np.array(config_center, dtype=np.float64)
+        shift = np.round(target_center - current_center).astype(int)
+        shifted = shift_costmap(cost, (int(shift[0]), int(shift[1])))
+        return shifted, (int(shift[0]), int(shift[1]))
 
     raise ValueError(f"Unknown recentering mode '{mode}'")
+
+
+def compute_config_center(
+    cost_shape: Tuple[int, int],
+    occ_size: Optional[Sequence[int]],
+) -> Optional[Tuple[float, float]]:
+    if not occ_size or len(occ_size) < 2:
+        return None
+    occ_h, occ_w = float(occ_size[0]), float(occ_size[1])
+    if occ_h <= 1 or occ_w <= 1:
+        return None
+    scale_row = cost_shape[0] / occ_h
+    scale_col = cost_shape[1] / occ_w
+    target_row = ((occ_h - 1.0) / 2.0) * scale_row
+    target_col = ((occ_w - 1.0) / 2.0) * scale_col
+    return (target_row, target_col)
 
 
 def _extract_infos(payload: Any) -> List[Dict[str, Any]]:
@@ -360,7 +388,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--recenter",
-        choices=["none", "bbox"],
+        choices=["none", "bbox", "ego"],
         default="none",
         help="Recentering strategy applied before cropping/windowing. "
         "'bbox' aligns the occupied bounding box center to the grid center.",
@@ -401,6 +429,22 @@ def parse_args() -> argparse.Namespace:
         help="Sample index used together with --ego-yaw-from-payload.",
     )
     parser.add_argument(
+        "--pc-range",
+        nargs=6,
+        type=float,
+        default=None,
+        metavar=("X_MIN", "Y_MIN", "Z_MIN", "X_MAX", "Y_MAX", "Z_MAX"),
+        help="Point cloud range (6 floats) used for inference.",
+    )
+    parser.add_argument(
+        "--occ-size",
+        nargs=3,
+        type=int,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Occupancy size (3 ints) used for inference.",
+    )
+    parser.add_argument(
         "--dump-config",
         type=Path,
         default=None,
@@ -422,9 +466,12 @@ def main() -> None:
         raise ValueError("No classes selected for cost mapping. Check your arguments.")
 
     cost_map = project_costmap(grid, class_weights, aggregate=args.aggregate)
+    config_center = None
+    if args.recenter == "ego":
+        config_center = compute_config_center(cost_map.shape[:2], args.occ_size)
     recentered_shift = (0, 0)
     if args.recenter != "none":
-        cost_map, recentered_shift = recenter_costmap(cost_map, args.recenter)
+        cost_map, recentered_shift = recenter_costmap(cost_map, args.recenter, config_center=config_center)
     if args.align_carla_y:
         cost_map = np.fliplr(cost_map)
     if args.rotate_degrees:
@@ -479,6 +526,8 @@ def main() -> None:
             "ego_yaw": ego_yaw,
             "ego_yaw_payload": str(args.ego_yaw_from_payload) if args.ego_yaw_from_payload else None,
             "ego_yaw_sample_index": args.ego_yaw_sample_index if args.ego_yaw_from_payload else None,
+            "pc_range": args.pc_range,
+            "occ_size": args.occ_size,
         }
         args.dump_config.parent.mkdir(parents=True, exist_ok=True)
         args.dump_config.write_text(json.dumps(summary, indent=2), encoding="utf-8")
