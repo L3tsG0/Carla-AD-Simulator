@@ -4,8 +4,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+import queue
+import threading
 
 import carla
+
+
+class _ImageSaveWorker:
+    """Background worker that writes CARLA images to disk."""
+
+    def __init__(self, max_queue: int = 512) -> None:
+        self._queue: "queue.Queue[tuple[carla.Image, str]]" = queue.Queue(max_queue)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, image: carla.Image, path: Path) -> None:
+        try:
+            self._queue.put_nowait((image, str(path)))
+        except queue.Full:
+            print(f"[CameraRig] Save queue full; dropping frame {image.frame} ({path}).")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop_event.set()
+        self._queue.join()
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                image, path = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                image.save_to_disk(path)
+            except RuntimeError as exc:
+                print(f"[CameraRig] Failed to save frame {image.frame} to {path}: {exc}")
+            finally:
+                self._queue.task_done()
 
 
 @dataclass(frozen=True)
@@ -27,12 +63,19 @@ class CameraInstance:
 class NuScenesCameraRig:
     """Camera rig that mimics nuScenes 6-camera setup."""
 
-    def __init__(self, world: carla.World, output_dir: Path, sensor_tick: float = 0.5) -> None:
+    def __init__(
+        self,
+        world: carla.World,
+        output_dir: Path,
+        sensor_tick: float = 0.5,
+        save_queue_size: int = 512,
+    ) -> None:
         self._world = world
         self._output_dir = Path(output_dir)
         self._sensor_tick = sensor_tick
         self._camera_bp = self._create_camera_blueprint()
         self._sensors: List[carla.Sensor] = []
+        self._save_worker = _ImageSaveWorker(max_queue=save_queue_size)
 
     def _create_camera_blueprint(self) -> carla.ActorBlueprint:
         blueprint = self._world.get_blueprint_library().find("sensor.camera.rgb")
@@ -122,8 +165,8 @@ class NuScenesCameraRig:
                 attach_to=vehicle,
             )
             sensor.listen(
-                lambda image, path=save_dir: image.save_to_disk(
-                    str(path / f"{image.frame}.png")
+                lambda image, path=save_dir: self._save_worker.enqueue(
+                    image, path / f"{image.frame}.png"
                 )
             )
             instances.append(CameraInstance(config=config, sensor=sensor))
@@ -138,3 +181,4 @@ class NuScenesCameraRig:
             if sensor.is_alive:
                 sensor.destroy()
         self._sensors.clear()
+        self._save_worker.stop()
