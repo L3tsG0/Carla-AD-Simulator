@@ -130,7 +130,7 @@ class AsyncInferenceWorker:
         self.thread.join(timeout=timeout)
 
     def _prepare_frame_inputs(self, frame: int) -> Optional[Tuple[str, Path, bool]]:
-        if wait_for_frame_images(self.camera_dir, frame, retries=40, delay=0.05):
+        if self._wait_for_frame_ready(frame):
             return str(frame), self.camera_dir, False
         if not self.args.async_mode:
             return None
@@ -138,6 +138,13 @@ class AsyncInferenceWorker:
         if staged is None:
             return None
         return staged[0], staged[1], True
+
+    def _wait_for_frame_ready(self, frame: int) -> bool:
+        """Block until all camera images for the frame are readable or stop is requested."""
+        while not self.stop_event.is_set():
+            if wait_for_frame_images(self.camera_dir, frame, retries=1, delay=0.05):
+                return True
+        return False
 
     def _stage_oldest_frame_set(self) -> Optional[Tuple[str, Path]]:
         job_id = f"async_{int(time.time() * 1000)}"
@@ -259,7 +266,10 @@ def main() -> None:
         if latest is not None and latest[0] != state["last_reported"]:
             state["last_reported"] = latest[0]
             result = latest[1]
-            print(f"[Driver] Latest inference frame {latest[0]} ready. Costmap: {result.costmap_image_path}")
+            message = f"[Driver] Latest inference frame {latest[0]} ready. Costmap: {result.costmap_image_path}"
+            if result.prediction_dense_path:
+                message += f" | Occupancy: {result.prediction_dense_path}"
+            print(message)
 
     driver = StraightLineDriver(driver_cfg)
     print(f"Starting drive. Saving camera images to {camera_dir}")
