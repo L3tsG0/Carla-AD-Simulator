@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import pickle
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import math
+import numpy as np
 import requests
 
 
@@ -16,11 +21,14 @@ import requests
 class PipelineResult:
     payload_path: Path
     prediction_dense_path: Optional[Path] = None
+    prediction_ego_path: Optional[Path] = None
     costmap_full_path: Optional[Path] = None
     costmap_window_path: Optional[Path] = None
     costmap_image_path: Optional[Path] = None
     occ_size: Optional[List[int]] = None
     pc_range: Optional[List[float]] = None
+    payload_artifact_path: Optional[Path] = None
+    metadata_path: Optional[Path] = None
 
 
 class OccupancyCostmapPipeline:
@@ -34,6 +42,8 @@ class OccupancyCostmapPipeline:
         tmp_dir: Optional[Path] = None,
         python_executable: str = sys.executable,
         post_capture_wait: float = 0.5,
+        default_occ_size: Optional[List[int]] = None,
+        default_pc_range: Optional[List[float]] = None,
     ) -> None:
         self.notebooks_dir = notebooks_dir
         self.api_url = api_url
@@ -47,10 +57,142 @@ class OccupancyCostmapPipeline:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         self.capture_script = notebooks_dir / "2d_prepare_single_frame.py"
-        self.costmap_script = notebooks_dir / "3a_occ_to_costmap.py"
         self.post_capture_wait = post_capture_wait
+        self.default_occ_size = default_occ_size or [512, 512, 40]
+        self.default_pc_range = default_pc_range or [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+        # Ensure OpenOccupancy is importable for the costmap utility.
+        if str(self.workspace_root) not in sys.path:
+            sys.path.append(str(self.workspace_root))
 
     # ----------------------------- helpers -----------------------------
+    def _copy_prediction_to_tmp(self, source: Path, dest_dir: Optional[Path] = None) -> Path:
+        """Copy the OpenOccupancy dense prediction into the working directory."""
+        dest_root = dest_dir or self.tmp_dir
+        timestamp = int(time.time())
+        base_name = f"{source.stem}_{timestamp}"
+        dest = dest_root / f"{base_name}{source.suffix}"
+        counter = 1
+        while dest.exists():
+            dest = dest_root / f"{base_name}_{counter}{source.suffix}"
+            counter += 1
+        shutil.copy2(source, dest)
+        return dest
+
+    @staticmethod
+    def _load_payload_info(payload_path: Path) -> Dict[str, Any]:
+        with payload_path.open("rb") as f:
+            payload = pickle.load(f)
+        if isinstance(payload, dict):
+            if "infos" in payload and isinstance(payload["infos"], list):
+                infos = payload["infos"]
+            elif "payload" in payload and isinstance(payload["payload"], dict):
+                infos = payload["payload"].get("infos", [])
+            else:
+                infos = []
+        else:
+            infos = []
+        if not infos:
+            raise ValueError("Payload does not contain 'infos'.")
+        return infos[0]
+
+    @staticmethod
+    def _quaternion_to_matrix(quat: List[float]) -> np.ndarray:
+        if len(quat) != 4:
+            raise ValueError(f"Quaternion must have 4 elements, got {quat}")
+        w, x, y, z = quat
+        norm = math.sqrt(w * w + x * x + y * y + z * z)
+        if norm == 0:
+            raise ValueError("Quaternion has zero magnitude.")
+        w, x, y, z = w / norm, x / norm, y / norm, z / norm
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float32,
+        )
+
+    def _compute_ego_indices(
+        self, payload_info: Dict[str, Any], occ_size: List[int], pc_range: List[float]
+    ) -> Tuple[float, float]:
+        lidar2ego_trans = payload_info.get("lidar2ego_translation")
+        lidar2ego_rot = payload_info.get("lidar2ego_rotation")
+        if lidar2ego_trans is None or lidar2ego_rot is None:
+            raise ValueError("Payload sample lacks lidar2ego transformation.")
+        lidar2ego_rot = self._quaternion_to_matrix(lidar2ego_rot)
+        lidar2ego_trans = np.asarray(lidar2ego_trans, dtype=np.float32)
+        ego_center_lidar = -lidar2ego_rot.T @ lidar2ego_trans
+        occ_arr = np.asarray(occ_size, dtype=np.float32)
+        pc_arr = np.asarray(pc_range, dtype=np.float32)
+        voxel_span = pc_arr[3:6] - pc_arr[0:3]
+        voxel_span[voxel_span == 0] = 1.0
+        voxel_size = voxel_span / occ_arr
+        voxel_size[voxel_size == 0] = 1.0
+        row_idx = (ego_center_lidar[0] - pc_arr[0]) / voxel_size[0]
+        col_idx = (ego_center_lidar[1] - pc_arr[1]) / voxel_size[1]
+        row_idx = float(np.clip(row_idx, 0.0, occ_arr[0] - 1.0))
+        col_idx = float(np.clip(col_idx, 0.0, occ_arr[1] - 1.0))
+        return row_idx, col_idx
+
+    @staticmethod
+    def _shift_dense_grid(grid: np.ndarray, row_shift: int, col_shift: int) -> np.ndarray:
+        if row_shift == 0 and col_shift == 0:
+            return grid.copy()
+        rows, cols = grid.shape[:2]
+        shifted = np.zeros_like(grid)
+        src_row_start = max(0, -row_shift)
+        src_row_end = min(rows, rows - row_shift)
+        src_col_start = max(0, -col_shift)
+        src_col_end = min(cols, cols - col_shift)
+        dest_row_start = src_row_start + row_shift
+        dest_row_end = src_row_end + row_shift
+        dest_col_start = src_col_start + col_shift
+        dest_col_end = src_col_end + col_shift
+        if src_row_start >= src_row_end or src_col_start >= src_col_end:
+            return shifted
+        shifted[
+            dest_row_start:dest_row_end, dest_col_start:dest_col_end
+        ] = grid[src_row_start:src_row_end, src_col_start:src_col_end]
+        return shifted
+
+    def _create_centered_prediction(
+        self,
+        prediction_path: Path,
+        payload_path: Path,
+        occ_size: Optional[List[int]],
+        pc_range: Optional[List[float]],
+        run_dir: Path,
+        run_identifier: str,
+    ) -> Optional[Path]:
+        if occ_size is None or pc_range is None:
+            return None
+        try:
+            payload_info = self._load_payload_info(payload_path)
+            ego_row, ego_col = self._compute_ego_indices(payload_info, occ_size, pc_range)
+        except Exception:
+            return None
+        target_row = (occ_size[0] - 1.0) / 2.0
+        target_col = (occ_size[1] - 1.0) / 2.0
+        row_shift = int(round(target_row - ego_row))
+        col_shift = int(round(target_col - ego_col))
+        if row_shift == 0 and col_shift == 0:
+            return None
+        grid = np.load(prediction_path)
+        centered = self._shift_dense_grid(grid, row_shift, col_shift)
+        ego_path = run_dir / f"pred_c_ego_{run_identifier}{prediction_path.suffix}"
+        np.save(ego_path, centered)
+        return ego_path
+
+    @staticmethod
+    def _infer_occ_size_from_npy(path: Path) -> List[int]:
+        arr = np.load(path, mmap_mode="r")
+        shape = arr.shape
+        if len(shape) < 3:
+            raise ValueError(f"Unexpected occupancy tensor shape {shape} (need at least 3 dims).")
+        return [int(shape[0]), int(shape[1]), int(shape[2])]
+
     def _run_subprocess(self, args: List[str]) -> None:
         completed = subprocess.run(
             args,
@@ -132,6 +274,7 @@ class OccupancyCostmapPipeline:
             dense_path = (self.openocc_root / dense_path).resolve()
         if not dense_path.exists():
             raise FileNotFoundError(f"pred_c_dense.npy not found: {dense_path}")
+        dense_path = self._copy_prediction_to_tmp(dense_path)
         occ_size = data.get("occ_size")
         pc_range = data.get("point_cloud_range")
         return dense_path, occ_size, pc_range
@@ -148,49 +291,134 @@ class OccupancyCostmapPipeline:
         occ_size: Optional[List[int]] = None,
         pc_range: Optional[List[float]] = None,
     ) -> PipelineResult:
-        output_full = self.tmp_dir / f"costmap_full_{int(time.time())}.npy"
-        output_window = output_full.with_name(output_full.stem.replace("full", "ego") + ".npy")
-        output_image = output_full.with_suffix(".png")
+        run_dir = self._create_run_dir()
+        run_identifier = run_dir.name.replace("run_", "")
+        if prediction_path is not None:
+            src_prediction = Path(prediction_path)
+            prediction_local = run_dir / f"pred_c_dense_{run_identifier}{src_prediction.suffix}"
+            shutil.copy2(src_prediction, prediction_local)
+            if src_prediction.parent == self.tmp_dir:
+                with contextlib.suppress(OSError):
+                    src_prediction.unlink()
+            prediction_path = prediction_local
+        if occ_size is None and prediction_path is not None:
+            with contextlib.suppress(Exception):
+                occ_size = self._infer_occ_size_from_npy(prediction_path)
+        prediction_ego = self._create_centered_prediction(
+            prediction_path,
+            payload_path,
+            occ_size,
+            pc_range,
+            run_dir,
+            run_identifier,
+        )
+        output_full = run_dir / f"costmap_full_{run_identifier}.npy"
+        output_window = run_dir / f"costmap_ego_{run_identifier}.npy"
+        output_image = run_dir / f"costmap_full_{run_identifier}.png"
 
-        args = [
-            self.python_exec,
-            str(self.costmap_script),
-            "--input",
-            str(prediction_path),
-            "--output",
-            str(output_full),
-            "--output-fixed-window",
-            str(output_window),
-            "--output-image",
-            str(output_image),
-            "--window-size",
-            str(window_size),
-            "--recenter",
-            recenter_mode,
-            "--ego-yaw-from-payload",
-            str(payload_path),
-        ]
-        if align_carla_y:
-            args.append("--align-carla-y")
-        if mark_ego_arrow:
-            args.append("--mark-ego-arrow")
-        if rotate_degrees:
-            args.extend(["--rotate-degrees", str(rotate_degrees)])
-        if occ_size:
-            args.extend(["--occ-size"] + [str(int(v)) for v in occ_size])
-        if pc_range:
-            args.extend(["--pc-range"] + [str(float(v)) for v in pc_range])
+        # ----------------- New costmap generation via CostmapGenerator -----------------
+        from OpenOccupancy.src.utils.costmap import CostmapGenerator
 
-        self._run_subprocess(args)
-        return PipelineResult(
+        grid = np.load(prediction_path)
+        grid_xy = (int(grid.shape[0]), int(grid.shape[1]))
+
+        # Prefer explicit occ_size; fall back to the grid shape.
+        if occ_size is None:
+            with contextlib.suppress(Exception):
+                occ_size = self._infer_occ_size_from_npy(prediction_path)
+        if pc_range is None:
+            pc_range = self.default_pc_range
+
+        ego_center = None
+        try:
+            payload_info = self._load_payload_info(payload_path)
+            base_occ_size = occ_size or list(grid.shape[:3])
+            ego_center = self._compute_ego_indices(payload_info, base_occ_size, pc_range)
+            # If metadata occ_size differs from the grid resolution, rescale the center.
+            if base_occ_size and (base_occ_size[0] != grid_xy[0] or base_occ_size[1] != grid_xy[1]):
+                scale_x = grid_xy[0] / float(base_occ_size[0])
+                scale_y = grid_xy[1] / float(base_occ_size[1])
+                ego_center = (ego_center[0] * scale_x, ego_center[1] * scale_y)
+            # Notebook parity: coarse grid index is divided by 4 before cropping.
+            ego_center = (ego_center[0] / 4.0, ego_center[1] / 4.0)
+        except Exception:
+            ego_center = None
+
+        cost_gen = CostmapGenerator(reduce="max", normalize=True)
+
+        # Full costmap
+        full_cost = cost_gen.make_topdown_costmap(grid)
+        output_full.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_full, full_cost.astype(np.float32))
+        # Keep image aligned with the ego-centered window for downstream viewing.
+
+        # Ego-centered crop (window)
+        # Notebook parity: fixed crop size (64, 64).
+        crop_dim = (min(64, grid_xy[0]), min(64, grid_xy[1]))
+
+        window_cost, window_bounds = cost_gen.generate(
+            grid,
+            center_xy_idx=ego_center,
+            crop_size_xy=crop_dim,
+        )
+
+        np.save(output_window, window_cost.astype(np.float32))
+        cost_gen.save_costmap(window_cost, output_image)
+
+        result = PipelineResult(
             payload_path=payload_path,
             prediction_dense_path=prediction_path,
+            prediction_ego_path=prediction_ego,
             costmap_full_path=output_full,
             costmap_window_path=output_window,
             costmap_image_path=output_image,
             occ_size=occ_size,
             pc_range=pc_range,
         )
+        result.payload_artifact_path = self._copy_payload_artifact(payload_path, output_full)
+        result.metadata_path = self._write_metadata(result)
+        return result
+
+    def _create_run_dir(self) -> Path:
+        """Create a dedicated directory for a single inference run."""
+        timestamp = int(time.time())
+        run_dir = self.tmp_dir / f"run_{timestamp}"
+        counter = 1
+        while run_dir.exists():
+            run_dir = self.tmp_dir / f"run_{timestamp}_{counter}"
+            counter += 1
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return run_dir
+    def _copy_payload_artifact(self, payload_path: Path, reference_output: Optional[Path]) -> Optional[Path]:
+        """Place a copy of the CARLA payload alongside the generated costmap files."""
+        if reference_output is None or not payload_path.exists():
+            return None
+        dest = reference_output.with_name(reference_output.stem + "_payload.pkl")
+        shutil.copy2(payload_path, dest)
+        return dest
+
+    def _write_metadata(self, result: PipelineResult) -> Path:
+        """Save metadata about the most recent costmap/occupancy artifacts."""
+        metadata = {
+            "payload_path": str(result.payload_path),
+            "prediction_dense_path": str(result.prediction_dense_path) if result.prediction_dense_path else None,
+            "prediction_ego_path": str(result.prediction_ego_path) if result.prediction_ego_path else None,
+            "costmap_full_path": str(result.costmap_full_path) if result.costmap_full_path else None,
+            "costmap_window_path": str(result.costmap_window_path) if result.costmap_window_path else None,
+            "costmap_image_path": str(result.costmap_image_path) if result.costmap_image_path else None,
+            "occ_size": result.occ_size,
+            "pc_range": result.pc_range,
+            "payload_artifact_path": str(result.payload_artifact_path) if result.payload_artifact_path else None,
+            "run_directory": str(result.costmap_full_path.parent) if result.costmap_full_path else None,
+            "timestamp": int(time.time()),
+        }
+        if result.costmap_full_path is not None:
+            metadata_path = result.costmap_full_path.with_suffix(".json")
+        else:
+            metadata_path = self.tmp_dir / f"costmap_metadata_{int(time.time())}.json"
+        with metadata_path.open("w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2)
+        return metadata_path
 
     def run_once(
         self,
@@ -215,6 +443,14 @@ class OccupancyCostmapPipeline:
         if not enable_inference:
             return PipelineResult(payload_path=payload)
         prediction, occ_size, pc_range = self.request_inference(payload)
+        if occ_size is None:
+            try:
+                occ_size = self._infer_occ_size_from_npy(prediction)
+            except Exception:
+                occ_size = self.default_occ_size
+        pc_range = pc_range or self.default_pc_range
+        if recenter_mode == "ego" and (occ_size is None or pc_range is None):
+            raise RuntimeError("Ego recentering requires occ_size and point_cloud_range from the inference API.")
         return self.build_costmap(
             prediction_path=prediction,
             payload_path=payload,
@@ -245,6 +481,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--workspace-root", type=Path, default=None)
     parser.add_argument("--post-capture-wait", type=float, default=0.5)
+    parser.add_argument(
+        "--occ-size",
+        nargs=3,
+        type=int,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Default occupancy grid size used when API does not return occ_size.",
+    )
+    parser.add_argument(
+        "--pc-range",
+        nargs=6,
+        type=float,
+        default=None,
+        metavar=("X_MIN", "Y_MIN", "Z_MIN", "X_MAX", "Y_MAX", "Z_MAX"),
+        help="Default point cloud range used when API does not return one.",
+    )
     parser.add_argument(
         "--carla-dir",
         type=Path,
@@ -278,6 +530,8 @@ def main() -> None:
         workspace_root=args.workspace_root,
         tmp_dir=args.tmp_dir,
         post_capture_wait=args.post_capture_wait,
+        default_occ_size=args.occ_size,
+        default_pc_range=args.pc_range,
     )
     result = pipeline.run_once(
         spawn_index=args.spawn_index,
