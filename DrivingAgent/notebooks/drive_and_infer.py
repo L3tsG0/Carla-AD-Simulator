@@ -104,6 +104,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose StraightLineDriver debug logging.",
     )
+    parser.add_argument("--use-lane-yaw", action="store_true", help="Replace spawn yaw with lane waypoint yaw.")
+    parser.add_argument("--use-lane-following", action="store_true", help="Apply simple lane-following steering.")
+    parser.add_argument("--steer-gain-yaw", type=float, default=0.8, help="Gain for yaw error in lane-follow steer.")
+    parser.add_argument("--steer-gain-lat", type=float, default=0.1, help="Gain for lateral error in lane-follow steer.")
     parser.add_argument(
         "--skip-inference",
         action="store_true",
@@ -135,6 +139,10 @@ def main() -> None:
         tick_timeout_seconds=args.tick_timeout_seconds,
         traffic_manager_port=args.traffic_manager_port,
         debug=args.driver_debug,
+        use_lane_yaw=args.use_lane_yaw,
+        use_lane_following=args.use_lane_following,
+        steer_gain_yaw=args.steer_gain_yaw,
+        steer_gain_lat=args.steer_gain_lat,
     )
     notebooks_dir = Path(__file__).resolve().parent
     captured_frames: List[int] = []
