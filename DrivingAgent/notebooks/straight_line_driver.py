@@ -40,6 +40,10 @@ class DriverConfig:
     debug: bool = False
     camera_save_queue_size: int = 4096
     camera_save_workers: int = 4
+    use_lane_yaw: bool = False
+    use_lane_following: bool = False
+    steer_gain_yaw: float = 0.8
+    steer_gain_lat: float = 0.1
 
 
 class StraightLineDriver:
@@ -77,8 +81,18 @@ class StraightLineDriver:
         spawn_points = self.world.get_map().get_spawn_points()
         if self.cfg.spawn_index >= len(spawn_points):
             raise ValueError(f"spawn_index {self.cfg.spawn_index} out of range ({len(spawn_points)} spawn points)")
+        spawn_transform = spawn_points[self.cfg.spawn_index]
+        if self.cfg.use_lane_yaw:
+            waypoint = self.world.get_map().get_waypoint(spawn_transform.location, project_to_road=True)
+            waypoint.transform.location.z += 0.5  # lift waypoint slightly to avoid collision with ground
+            lane_rot = waypoint.transform.rotation
+            diff = lane_rot.yaw - spawn_transform.rotation.yaw
+            self._debug(
+                f"Spawn yaw {spawn_transform.rotation.yaw:.3f} -> lane yaw {lane_rot.yaw:.3f} (diff {diff:.3f})"
+            )
+            spawn_transform = carla.Transform(spawn_transform.location, lane_rot)
         blueprint = self.blueprints.find("vehicle.audi.a2")
-        vehicle = self.world.spawn_actor(blueprint, spawn_points[self.cfg.spawn_index])
+        vehicle = self.world.spawn_actor(blueprint, spawn_transform)
         return vehicle
 
     @staticmethod
@@ -90,7 +104,7 @@ class StraightLineDriver:
         control = carla.VehicleControl()
         control.throttle = max(0.0, min(1.0, throttle))
         control.brake = max(0.0, min(1.0, brake))
-        control.steer = 0.0  # straight
+        control.steer = 0.0  # straight (may be overridden by lane following)
         control.hand_brake = False
         control.reverse = False
         vehicle.apply_control(control)
@@ -157,6 +171,27 @@ class StraightLineDriver:
                     time.sleep(remaining)
                 break
 
+    @staticmethod
+    def _normalize_angle_rad(angle: float) -> float:
+        """Normalize angle to [-pi, pi]."""
+        return (angle + math.pi) % (2 * math.pi) - math.pi
+
+    def _compute_lane_follow_steer(self) -> float:
+        if not self.cfg.use_lane_following or self.vehicle is None:
+            return 0.0
+        waypoint = self.world.get_map().get_waypoint(self.vehicle.get_location(), project_to_road=True)
+        if waypoint is None:
+            return 0.0
+        lane_tf = waypoint.transform
+        veh_tf = self.vehicle.get_transform()
+        yaw_err_deg = lane_tf.rotation.yaw - veh_tf.rotation.yaw
+        yaw_err_rad = self._normalize_angle_rad(math.radians(yaw_err_deg))
+        to_lane = lane_tf.location - veh_tf.location
+        right = lane_tf.get_right_vector()
+        cross_track = right.x * to_lane.x + right.y * to_lane.y + right.z * to_lane.z
+        steer = yaw_err_rad * self.cfg.steer_gain_yaw + cross_track * self.cfg.steer_gain_lat
+        return max(-1.0, min(1.0, steer))
+
     def _compute_control(self) -> carla.VehicleControl:
         speed = self._current_speed(self.vehicle)
         error = self.cfg.target_speed_mps - speed
@@ -169,7 +204,7 @@ class StraightLineDriver:
         control = carla.VehicleControl()
         control.throttle = max(0.0, min(1.0, throttle))
         control.brake = max(0.0, min(1.0, brake))
-        control.steer = 0.0
+        control.steer = self._compute_lane_follow_steer()
         control.hand_brake = False
         control.reverse = False
         return control
@@ -252,6 +287,10 @@ def parse_args() -> DriverConfig:
     parser.add_argument("--driver-debug", action="store_true")
     parser.add_argument("--camera-save-queue-size", type=int, default=4096)
     parser.add_argument("--camera-save-workers", type=int, default=4)
+    parser.add_argument("--use-lane-yaw", action="store_true", help="Replace spawn yaw with lane waypoint yaw.")
+    parser.add_argument("--use-lane-following", action="store_true", help="Apply simple lane-following steering.")
+    parser.add_argument("--steer-gain-yaw", type=float, default=0.8, help="Gain for yaw error in lane-follow steer.")
+    parser.add_argument("--steer-gain-lat", type=float, default=0.1, help="Gain for lateral error in lane-follow steer.")
 
     args = parser.parse_args()
     return DriverConfig(
@@ -273,6 +312,10 @@ def parse_args() -> DriverConfig:
         debug=args.driver_debug,
         camera_save_queue_size=args.camera_save_queue_size,
         camera_save_workers=args.camera_save_workers,
+        use_lane_yaw=args.use_lane_yaw,
+        use_lane_following=args.use_lane_following,
+        steer_gain_yaw=args.steer_gain_yaw,
+        steer_gain_lat=args.steer_gain_lat,
     )
 
 
