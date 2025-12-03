@@ -194,6 +194,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace-root", type=Path, default=Path("/home/tsuruoka/hdd/BEV"))
     parser.add_argument("--fixed-delta-seconds", type=float, default=0.1)
     parser.add_argument("--async-mode", action="store_true")
+    parser.add_argument(
+        "--inference-mode",
+        type=str,
+        choices=["async", "sync"],
+        default="async",
+        help="Inference execution mode. async=queue/worker (current behavior), sync=block each tick until inference completes.",
+    )
     parser.add_argument("--stabilization-seconds", type=float, default=5.0)
     parser.add_argument("--sensor-warmup-seconds", type=float, default=1.0)
     parser.add_argument("--tick-timeout-seconds", type=float, default=10.0)
@@ -245,25 +252,65 @@ def main() -> None:
 
     notebooks_dir = Path(__file__).resolve().parent
     worker: Optional[AsyncInferenceWorker] = None
+    pipeline: Optional[OccupancyCostmapPipeline] = None
     if not args.skip_inference:
         pipeline = OccupancyCostmapPipeline(
             notebooks_dir=notebooks_dir,
             api_url=args.api_url,
             workspace_root=args.workspace_root,
         )
-        worker = AsyncInferenceWorker(
-            pipeline=pipeline,
-            camera_dir=camera_dir,
-            args=args,
-            max_pending=args.max_pending_frames,
-        )
+        if args.inference_mode == "async":
+            worker = AsyncInferenceWorker(
+                pipeline=pipeline,
+                camera_dir=camera_dir,
+                args=args,
+                max_pending=args.max_pending_frames,
+            )
 
     state = {"last_reported": None}
     captured_frames: List[int] = []
+    process_every_n = max(1, args.frame_skip)
 
     def on_tick(vehicle, frame):
         captured_frames.append(frame)
-        if (len(captured_frames) - 1) % max(1, args.frame_skip) != 0:
+        if (len(captured_frames) - 1) % process_every_n != 0:
+            return
+        if args.skip_inference:
+            print(f"[Driver] Captured frame {frame} (inference skipped)")
+            return
+        if args.inference_mode == "sync":
+            if pipeline is None:
+                print(f"[Driver] Frame {frame}: pipeline unavailable; skipping.")
+                return
+            # Wait for all camera images to land before running inference.
+            wait_ok = wait_for_frame_images(
+                camera_dir,
+                frame,
+                retries=max(1, int(args.tick_timeout_seconds / 0.05)),
+                delay=0.05,
+            )
+            if not wait_ok:
+                print(f"[Driver] Frame {frame}: images not ready within timeout; skipping inference.")
+                return
+            try:
+                result = pipeline.run_once(
+                    spawn_index=args.spawn_index,
+                    record_seconds=args.fixed_delta_seconds,
+                    window_size=args.window_size,
+                    rotate_degrees=args.rotate_degrees,
+                    align_carla_y=args.align_carla_y,
+                    recenter_mode=args.recenter,
+                    carla_dir=camera_dir,
+                    frame_id=str(frame),
+                    filename_template="{cam}/{frame}",
+                )
+                state["last_reported"] = frame
+                message = f"[Driver] Frame {frame} inference complete. Costmap: {result.costmap_image_path}"
+                if result.prediction_dense_path:
+                    message += f" | Occupancy: {result.prediction_dense_path}"
+                print(message)
+            except RuntimeError as exc:
+                print(f"[Driver] Frame {frame} inference failed: {exc}")
             return
         if worker is None:
             print(f"[Driver] Captured frame {frame}")
@@ -280,14 +327,24 @@ def main() -> None:
             print(message)
 
     driver = StraightLineDriver(driver_cfg)
+    if args.inference_mode == "sync" and args.async_mode:
+        print("[Driver] Warning: sync inference requested while CARLA async tick mode is enabled.")
+        print("         Blocking until inference finishes may not align with simulator ticks.")
     print(f"Starting drive. Saving camera images to {camera_dir}")
     driver.run(on_tick=on_tick)
-    if worker is None:
-        print(f"Drive complete. Captured {len(captured_frames)} frames at {camera_dir}")
-    else:
+
+    if args.skip_inference:
+        print(f"Drive complete. Captured {len(captured_frames)} frames at {camera_dir} (inference skipped)")
+    elif args.inference_mode == "async":
         print("Drive complete; waiting for pending inference jobs...")
-        worker.stop()
-        print("All pending inference jobs finished.")
+        if worker is not None:
+            worker.stop()
+            print("All pending inference jobs finished.")
+        else:
+            print("No worker was started; nothing to drain.")
+        print(f"Captured {len(captured_frames)} frames at {camera_dir}")
+    else:
+        print(f"Drive complete with synchronous inference. Captured {len(captured_frames)} frames at {camera_dir}")
 
 
 if __name__ == "__main__":
