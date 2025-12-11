@@ -6,7 +6,7 @@ import threading
 import time
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import carla
 import numpy as np
@@ -14,6 +14,7 @@ from PIL import Image
 
 from straight_line_driver import DriverConfig, StraightLineDriver
 from occupancy_pipeline import OccupancyCostmapPipeline, PipelineResult
+from run_logger import RunLogger
 
 # Ensure DrivingAgent/src is importable for shared planners/utilities.
 THIS_DIR = Path(__file__).resolve().parent
@@ -32,6 +33,20 @@ CAM_NAMES = [
     "CAM_BACK_RIGHT",
 ]
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+
+def _serialize_args(args: argparse.Namespace) -> Dict[str, object]:
+    data: Dict[str, object] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            data[key] = str(value)
+        else:
+            data[key] = value
+    return data
+
+
+def _path_str(path: Optional[Path]) -> Optional[str]:
+    return str(path) if path is not None else None
 
 
 def _frame_image_path(cam_dir: Path, frame_id: int) -> Optional[Path]:
@@ -313,6 +328,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print control debug (target speed, throttle/brake/reverse, velocity, yaw) each tick.",
     )
+    parser.add_argument(
+        "--log-jsonl",
+        type=Path,
+        default=None,
+        help="Path to structured JSONL log (default: run directory / drive_log.jsonl).",
+    )
+    parser.add_argument(
+        "--disable-run-logger",
+        action="store_true",
+        help="Disable structured JSONL logging even if --log-jsonl is provided.",
+    )
     return parser.parse_args()
 
 
@@ -323,6 +349,10 @@ def main() -> None:
     if camera_dir.exists():
         shutil.rmtree(camera_dir)
     camera_dir.mkdir(parents=True, exist_ok=True)
+
+    default_log_path = args.log_jsonl or (camera_dir / "drive_log.jsonl")
+    run_logger = RunLogger(default_log_path, enabled=not args.disable_run_logger)
+    run_logger.log("run_start", args=_serialize_args(args), camera_dir=str(camera_dir))
 
     occ_planner: Optional[STP3StyleLongitudinalPlanner] = None
     if args.use_occ_planner:
@@ -390,6 +420,7 @@ def main() -> None:
             cost_aggregate=args.cost_aggregate,
             attack_config=args.attack_config,
             run_artifact_root=camera_dir,
+            run_logger=run_logger,
         )
         if args.inference_mode == "async":
             worker = AsyncInferenceWorker(
@@ -403,7 +434,7 @@ def main() -> None:
     captured_frames: List[int] = []
     process_every_n = max(1, args.frame_skip)
 
-    def _plan_with_cached(vehicle, source: str = "tick") -> None:
+    def _plan_with_cached(vehicle, frame: Optional[int] = None, source: str = "tick") -> None:
         """Run planner on cached costmap every tick."""
         nonlocal planner_state
         if not args.use_occ_planner or occ_planner is None:
@@ -448,6 +479,16 @@ def main() -> None:
         new_target = max(0.0, lookahead_target)
         driver_cfg.target_speed_mps = new_target
         planner_state["last_target"] = new_target
+        if run_logger.enabled:
+            run_logger.log(
+                "planner",
+                frame=frame,
+                source=source,
+                next_speed=float(best["next_speed"]),
+                accel=float(best["accel"]),
+                cost=float(best["total_cost"]),
+                target=new_target,
+            )
         if source != "tick":
             print(
                 f"[Planner] frame {planner_state.get('last_frame')} -> "
@@ -471,7 +512,7 @@ def main() -> None:
             return
         planner_state["costmap"] = costmap
         planner_state["last_frame"] = frame_id
-        _plan_with_cached(vehicle, source="inference")
+        _plan_with_cached(vehicle, frame=frame_id, source="inference")
 
     def _ensure_collision_sensor(vehicle: carla.Vehicle) -> None:
         nonlocal collision_sensor
@@ -491,6 +532,15 @@ def main() -> None:
                 )
                 collision_events.append(msg)
                 print(msg)
+                if run_logger.enabled:
+                    impulse = event.normal_impulse
+                    run_logger.log(
+                        "collision",
+                        frame=int(event.frame),
+                        impulse=float(impulse.length()),
+                        impulse_components={"x": impulse.x, "y": impulse.y, "z": impulse.z},
+                        other_actor={"id": other.id, "type": other.type_id},
+                    )
 
             collision_sensor.listen(_on_coll)
             print("[Collision] Sensor attached to ego vehicle.")
@@ -501,19 +551,42 @@ def main() -> None:
         captured_frames.append(frame)
         _ensure_collision_sensor(vehicle)
         # Run planner every tick using cached costmap (if any).
-        _plan_with_cached(vehicle, source="tick")
+        _plan_with_cached(vehicle, frame=frame, source="tick")
+        vel = vehicle.get_velocity()
+        transform = vehicle.get_transform()
+        yaw = transform.rotation.yaw
+        ctrl = vehicle.get_control()
+        fwd = transform.get_forward_vector()
+        signed_speed = vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z
+        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
         if args.log_control_debug:
-            vel = vehicle.get_velocity()
-            yaw = vehicle.get_transform().rotation.yaw
-            ctrl = vehicle.get_control()
-            fwd = vehicle.get_transform().get_forward_vector()
-            signed_speed = vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z
-            speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             print(
                 f"[CtrlDebug] frame={frame} target={driver_cfg.target_speed_mps:.2f} "
                 f"throttle={ctrl.throttle:.2f} brake={ctrl.brake:.2f} reverse={ctrl.reverse} "
                 f"speed={speed:.2f} fwd_speed={signed_speed:.2f} "
                 f"vel=({vel.x:.2f},{vel.y:.2f},{vel.z:.2f}) yaw={yaw:.2f}"
+            )
+        if run_logger.enabled:
+            attack_state = None
+            if pipeline is not None and pipeline.attack_simulator is not None:
+                attack_state = pipeline.attack_simulator.snapshot()
+            location = transform.location
+            run_logger.log(
+                "tick",
+                frame=frame,
+                target_speed=driver_cfg.target_speed_mps,
+                speed=speed,
+                forward_speed=signed_speed,
+                position={"x": location.x, "y": location.y, "z": location.z},
+                yaw=yaw,
+                velocity={"x": vel.x, "y": vel.y, "z": vel.z},
+                control={
+                    "throttle": ctrl.throttle,
+                    "brake": ctrl.brake,
+                    "steer": ctrl.steer,
+                    "reverse": ctrl.reverse,
+                },
+                attack_state=attack_state,
             )
         if (len(captured_frames) - 1) % process_every_n != 0:
             return
@@ -551,6 +624,15 @@ def main() -> None:
                 if result.prediction_dense_path:
                     message += f" | Occupancy: {result.prediction_dense_path}"
                 print(message)
+                if run_logger.enabled:
+                    run_logger.log(
+                        "inference",
+                        frame=frame,
+                        mode="sync",
+                        costmap=_path_str(result.costmap_window_path),
+                        costmap_image=_path_str(result.costmap_image_path),
+                        prediction=_path_str(result.prediction_dense_path),
+                    )
                 _apply_occ_planner(result, vehicle)
             except RuntimeError as exc:
                 print(f"[Driver] Frame {frame} inference failed: {exc}")
@@ -560,6 +642,8 @@ def main() -> None:
             return
         if not worker.submit(frame):
             print(f"[Driver] Frame {frame} dropped (worker queue full).")
+            if run_logger.enabled:
+                run_logger.log("inference_drop", frame=frame, reason="worker_queue_full")
         latest = worker.get_latest_result()
         if latest is not None and latest[0] != state["last_reported"]:
             state["last_reported"] = latest[0]
@@ -568,6 +652,15 @@ def main() -> None:
             if result.prediction_dense_path:
                 message += f" | Occupancy: {result.prediction_dense_path}"
             print(message)
+            if run_logger.enabled:
+                run_logger.log(
+                    "inference",
+                    frame=latest[0],
+                    mode="async",
+                    costmap=_path_str(result.costmap_window_path),
+                    costmap_image=_path_str(result.costmap_image_path),
+                    prediction=_path_str(result.prediction_dense_path),
+                )
             # Attach frame id for planner bookkeeping
             result.frame_id = latest[0]
             _apply_occ_planner(result, vehicle)
@@ -630,6 +723,14 @@ def main() -> None:
             test_car.destroy()
         except Exception:
             pass
+
+    run_logger.log(
+        "run_end",
+        frames=len(captured_frames),
+        collisions=len(collision_events),
+        camera_dir=str(camera_dir),
+    )
+    run_logger.flush()
 
 
 if __name__ == "__main__":

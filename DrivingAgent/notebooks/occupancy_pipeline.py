@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 
+from run_logger import RunLogger
+
 
 @dataclass
 class PipelineResult:
@@ -88,6 +90,7 @@ class AttackSimulator:
         self._last_ego_global: Optional[np.ndarray] = None
         self._cumulative_travel_m: float = 0.0
         self.tick_seconds = float(self.config.get("tick_seconds", 0.1))
+        self.last_operation: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def load_from_path(path: Path, *, tmp_dir: Path) -> "AttackSimulator":
@@ -127,33 +130,50 @@ class AttackSimulator:
             return prediction_path
         grid = np.load(prediction_path)
         changed = False
+        extra: Dict[str, Any] = {}
         if self.mode == "hide":
-            changed = self._apply_hiding(grid)
+            changed, extra = self._apply_hiding(grid)
         elif self.mode == "appear":
-            changed = self._apply_appearing(grid, payload_info, pc_range, occ_size)
+            changed, extra = self._apply_appearing(grid, payload_info, pc_range, occ_size)
+        else:
+            extra["reason"] = "mode_unsupported"
+        log_payload = {"mode": self.mode, "changed": changed}
+        log_payload.update(extra)
+        self.last_operation = log_payload
         if not changed:
             return prediction_path
         attacked_path = self._write_attacked(prediction_path, grid)
         return attacked_path
 
-    def _apply_hiding(self, grid: np.ndarray) -> bool:
+    def _apply_hiding(self, grid: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+        info: Dict[str, Any] = {
+            "target_class_id": self.target_class_id,
+            "hide_probability": self.hide_probability,
+        }
         if self.hide_probability <= 0.0 or grid.ndim < 3:
-            return False
+            info["reason"] = "probability_zero"
+            return False, info
         mask = grid == self.target_class_id
         total = int(mask.sum())
+        info["total_voxels"] = total
         if total == 0:
-            return False
+            info["reason"] = "no_target_voxels"
+            return False, info
         take = int(round(total * self.hide_probability))
         if take <= 0:
-            return False
+            info["reason"] = "sample_zero"
+            return False, info
         take = min(total, take)
         flat_indices = np.flatnonzero(mask)
         if flat_indices.size == 0:
-            return False
+            info["reason"] = "no_indices"
+            return False, info
         selected = self.rng.choice(flat_indices, size=take, replace=False)
         flat_grid = grid.reshape(-1)
         flat_grid[selected] = self.hide_fill_class_id
-        return True
+        info["removed_voxels"] = int(take)
+        info["fill_class_id"] = self.hide_fill_class_id
+        return True, info
 
     def _apply_appearing(
         self,
@@ -161,18 +181,26 @@ class AttackSimulator:
         payload_info: Optional[Dict[str, Any]],
         pc_range: Optional[List[float]],
         occ_size: Optional[List[int]],
-    ) -> bool:
+    ) -> Tuple[bool, Dict[str, Any]]:
+        meta: Dict[str, Any] = {
+            "target_class_id": self.target_class_id,
+            "appear_probability": self.appear_probability,
+        }
         if self.appear_probability <= 0.0 or grid.ndim < 3:
-            return False
+            meta["reason"] = "probability_zero"
+            return False, meta
         if pc_range is None or payload_info is None:
             print("[AttackSimulator] Appearing attack requires payload info and pc_range.")
-            return False
+            meta["reason"] = "missing_payload"
+            return False, meta
         anchor_global = self._resolve_anchor_global(payload_info)
         if anchor_global is None:
-            return False
+            meta["reason"] = "anchor_unavailable"
+            return False, meta
         anchor_lidar = self._global_to_lidar(payload_info, anchor_global)
         if anchor_lidar is None:
-            return False
+            meta["reason"] = "lidar_transform_failed"
+            return False, meta
         grid_shape = np.array(grid.shape[:3], dtype=np.float32)
         mins_raw = np.asarray(pc_range[:3], dtype=np.float32)
         spans_raw = np.asarray(pc_range[3:6], dtype=np.float32) - mins_raw
@@ -191,7 +219,8 @@ class AttackSimulator:
         scale = grid_shape / reference_shape
         center *= scale
         if np.any(np.isnan(center)):
-            return False
+            meta["reason"] = "nan_center"
+            return False, meta
         center = np.clip(center, 0.0, grid_shape - 1.0)
         box_dims_world = np.maximum(np.asarray(self.appear_box_m, dtype=np.float32), 1e-3)
         box_dims = box_dims_world[order]
@@ -205,14 +234,27 @@ class AttackSimulator:
         x0, y0, z0 = min_idx.tolist()
         x1, y1, z1 = max_idx.tolist()
         if x0 >= x1 or y0 >= y1 or z0 >= z1:
-            return False
+            meta["reason"] = "empty_region"
+            meta["voxel_bounds"] = {"min": min_idx.tolist(), "max": max_idx.tolist()}
+            return False, meta
         region = grid[x0:x1, y0:y1, z0:z1]
         random_mask = self.rng.random(region.shape) < self.appear_probability
         if not random_mask.any():
-            return False
+            meta["reason"] = "mask_empty"
+            meta["voxel_bounds"] = {"min": min_idx.tolist(), "max": max_idx.tolist()}
+            return False, meta
         region[random_mask] = self.target_class_id
         grid[x0:x1, y0:y1, z0:z1] = region
-        return True
+        meta.update(
+            {
+                "anchor_global": anchor_global.tolist(),
+                "anchor_lidar": anchor_lidar.tolist(),
+                "voxel_bounds": {"min": min_idx.tolist(), "max": max_idx.tolist()},
+                "region_shape": [int(x1 - x0), int(y1 - y0), int(z1 - z0)],
+                "placed_voxels": int(random_mask.sum()),
+            }
+        )
+        return True, meta
 
     def _resolve_anchor_global(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
         if self.anchor_override is not None:
@@ -318,6 +360,18 @@ class AttackSimulator:
         np.save(dest, grid)
         return dest
 
+    def snapshot(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "mode": self.mode,
+            "anchor_mode": self.anchor_mode,
+            "cumulative_travel_m": self._cumulative_travel_m,
+        }
+        if self._fixed_anchor_global is not None:
+            data["fixed_anchor"] = self._fixed_anchor_global.tolist()
+        if self.last_operation is not None:
+            data["last_operation"] = self.last_operation
+        return data
+
 
 class OccupancyCostmapPipeline:
     """Run CARLA capture -> OpenOccupancy inference -> costmap generation in one call."""
@@ -336,6 +390,7 @@ class OccupancyCostmapPipeline:
         cost_aggregate: str = "sum",
         attack_config: Optional[Path] = None,
         run_artifact_root: Optional[Path] = None,
+        run_logger: Optional[RunLogger] = None,
     ) -> None:
         self.notebooks_dir = notebooks_dir
         self.api_url = api_url
@@ -359,6 +414,7 @@ class OccupancyCostmapPipeline:
         self.default_pc_range = default_pc_range or [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.class_weights = self._load_class_weights(class_weight_json)
         self.cost_aggregate = cost_aggregate
+        self.run_logger = run_logger
         self.attack_simulator: Optional[AttackSimulator] = None
         if attack_config is not None:
             try:
@@ -385,6 +441,16 @@ class OccupancyCostmapPipeline:
             counter += 1
         shutil.copy2(source, dest)
         return dest
+
+    def _log_attack_event(self, frame_id: Optional[str]) -> None:
+        if self.run_logger is None or self.attack_simulator is None:
+            return
+        info = self.attack_simulator.last_operation
+        if not info:
+            return
+        payload = {"frame_id": frame_id}
+        payload.update(info)
+        self.run_logger.log("attack", **payload)
 
     @staticmethod
     def _load_class_weights(path: Optional[Path]) -> Optional[dict[int, float]]:
@@ -870,6 +936,7 @@ class OccupancyCostmapPipeline:
                         occ_size=occ_size,
                         pc_range=pc_range or self.default_pc_range,
                     )
+                    self._log_attack_event(frame_id)
                 except Exception as exc:
                     print(f"[AttackSimulator] Attack application failed: {exc}")
         if occ_size is None:
