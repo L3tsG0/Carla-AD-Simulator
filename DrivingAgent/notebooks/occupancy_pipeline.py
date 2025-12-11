@@ -3,16 +3,17 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import pickle
+import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import math
 import numpy as np
 import requests
 
@@ -29,6 +30,7 @@ class PipelineResult:
     pc_range: Optional[List[float]] = None
     payload_artifact_path: Optional[Path] = None
     metadata_path: Optional[Path] = None
+    front_camera_image_path: Optional[Path] = None
 
 
 class OccupancyCostmapPipeline:
@@ -46,6 +48,7 @@ class OccupancyCostmapPipeline:
         default_pc_range: Optional[List[float]] = None,
         class_weight_json: Optional[Path] = None,
         cost_aggregate: str = "sum",
+        run_artifact_root: Optional[Path] = None,
     ) -> None:
         self.notebooks_dir = notebooks_dir
         self.api_url = api_url
@@ -57,6 +60,11 @@ class OccupancyCostmapPipeline:
 
         self.tmp_dir = tmp_dir or notebooks_dir / "tmp" / "pipeline"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        if run_artifact_root is not None:
+            self.run_artifact_root = Path(run_artifact_root).resolve()
+            self.run_artifact_root.mkdir(parents=True, exist_ok=True)
+        else:
+            self.run_artifact_root = None
 
         self.capture_script = notebooks_dir / "2d_prepare_single_frame.py"
         self.post_capture_wait = post_capture_wait
@@ -316,8 +324,10 @@ class OccupancyCostmapPipeline:
         recenter_mode: str = "bbox",
         occ_size: Optional[List[int]] = None,
         pc_range: Optional[List[float]] = None,
+        frame_id: Optional[str] = None,
+        carla_dir: Optional[Path] = None,
     ) -> PipelineResult:
-        run_dir = self._create_run_dir()
+        run_dir = self._create_run_dir(frame_id=frame_id)
         run_identifier = run_dir.name.replace("run_", "")
         if prediction_path is not None:
             src_prediction = Path(prediction_path)
@@ -428,20 +438,74 @@ class OccupancyCostmapPipeline:
             occ_size=occ_size,
             pc_range=pc_range,
         )
+        result.front_camera_image_path = self._copy_front_camera_image(carla_dir, frame_id, run_dir)
         result.payload_artifact_path = self._copy_payload_artifact(payload_path, output_full)
         result.metadata_path = self._write_metadata(result)
         return result
 
-    def _create_run_dir(self) -> Path:
+    FRONT_CAMERA_NAME = "CAM_FRONT"
+    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+    @staticmethod
+    def _sanitize_identifier(identifier: Optional[str]) -> str:
+        if not identifier:
+            return str(int(time.time()))
+        ident = str(identifier)
+        ident = ident.strip()
+        ident = re.sub(r"[^A-Za-z0-9_-]+", "_", ident)
+        ident = ident.strip("_")
+        if ident.isdigit():
+            return f"{int(ident):06d}"
+        return ident or str(int(time.time()))
+
+    def _create_run_dir(self, frame_id: Optional[str] = None) -> Path:
         """Create a dedicated directory for a single inference run."""
-        timestamp = int(time.time())
-        run_dir = self.tmp_dir / f"run_{timestamp}"
+        if self.run_artifact_root is None:
+            timestamp = int(time.time())
+            run_dir = self.tmp_dir / f"run_{timestamp}"
+            counter = 1
+            while run_dir.exists():
+                run_dir = self.tmp_dir / f"run_{timestamp}_{counter}"
+                counter += 1
+            run_dir.mkdir(parents=True, exist_ok=False)
+            return run_dir
+        base = self.run_artifact_root
+        identifier = self._sanitize_identifier(frame_id)
+        if identifier and not identifier.startswith("tick_"):
+            dir_name = f"tick_{identifier}"
+        else:
+            dir_name = identifier or f"tick_{int(time.time())}"
+        run_dir = base / dir_name
         counter = 1
         while run_dir.exists():
-            run_dir = self.tmp_dir / f"run_{timestamp}_{counter}"
+            run_dir = base / f"{dir_name}_{counter}"
             counter += 1
         run_dir.mkdir(parents=True, exist_ok=False)
         return run_dir
+
+    def _copy_front_camera_image(
+        self, carla_dir: Optional[Path], frame_id: Optional[str], run_dir: Path
+    ) -> Optional[Path]:
+        if carla_dir is None or frame_id is None:
+            return None
+        cam_dir = Path(carla_dir) / self.FRONT_CAMERA_NAME
+        if not cam_dir.exists():
+            return None
+        source = None
+        for ext in self.IMAGE_EXTENSIONS:
+            candidate = cam_dir / f"{frame_id}{ext}"
+            if candidate.exists():
+                source = candidate
+                break
+        if source is None:
+            return None
+        dest = run_dir / f"{self.FRONT_CAMERA_NAME}_{frame_id}{source.suffix.lower()}"
+        try:
+            shutil.copy2(source, dest)
+        except Exception:
+            return None
+        return dest
+
     def _copy_payload_artifact(self, payload_path: Path, reference_output: Optional[Path]) -> Optional[Path]:
         """Place a copy of the CARLA payload alongside the generated costmap files."""
         if reference_output is None or not payload_path.exists():
@@ -462,6 +526,7 @@ class OccupancyCostmapPipeline:
             "occ_size": result.occ_size,
             "pc_range": result.pc_range,
             "payload_artifact_path": str(result.payload_artifact_path) if result.payload_artifact_path else None,
+            "front_camera_image_path": str(result.front_camera_image_path) if result.front_camera_image_path else None,
             "run_directory": str(result.costmap_full_path.parent) if result.costmap_full_path else None,
             "timestamp": int(time.time()),
         }
@@ -513,6 +578,8 @@ class OccupancyCostmapPipeline:
             recenter_mode=recenter_mode,
             occ_size=occ_size,
             pc_range=pc_range,
+            frame_id=frame_id,
+            carla_dir=carla_dir,
         )
 
 

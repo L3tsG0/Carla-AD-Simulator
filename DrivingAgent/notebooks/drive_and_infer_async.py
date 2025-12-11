@@ -229,6 +229,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-lane-following", action="store_true", help="Apply simple lane-following steering.")
     parser.add_argument("--steer-gain-yaw", type=float, default=0.8, help="Gain for yaw error in lane-follow steer.")
     parser.add_argument("--steer-gain-lat", type=float, default=0.1, help="Gain for lateral error in lane-follow steer.")
+    parser.add_argument(
+        "--steer-speed-decay",
+        type=float,
+        default=0.3,
+        help="Scale factor that controls speed-based decay of lane-follow steer gains (higher => more decay).",
+    )
+    parser.add_argument(
+        "--yaw-gain-smooth",
+        action="store_true",
+        help="Enable speed-based smoothing for yaw/lateral gains (uses --steer-speed-decay).",
+    )
     parser.add_argument("--use-occ-planner", action="store_true", help="Use occupancy-based longitudinal planner.")
     parser.add_argument("--planner-v-ref", type=float, default=5.0, help="Preferred speed for occupancy planner [m/s].")
     parser.add_argument("--planner-horizon-s", type=float, default=2.0, help="Planning horizon for occupancy planner [s].")
@@ -305,6 +316,7 @@ def main() -> None:
     camera_dir = (args.camera_output_root / f"run_{timestamp}").resolve()
     if camera_dir.exists():
         shutil.rmtree(camera_dir)
+    camera_dir.mkdir(parents=True, exist_ok=True)
 
     occ_planner: Optional[STP3StyleLongitudinalPlanner] = None
     if args.use_occ_planner:
@@ -345,6 +357,8 @@ def main() -> None:
         use_lane_following=args.use_lane_following,
         steer_gain_yaw=args.steer_gain_yaw,
         steer_gain_lat=args.steer_gain_lat,
+        steer_speed_decay=args.steer_speed_decay,
+        yaw_gain_smooth=args.yaw_gain_smooth,
     )
 
     planner_state = {
@@ -368,6 +382,7 @@ def main() -> None:
             workspace_root=args.workspace_root,
             class_weight_json=args.class_weight_json,
             cost_aggregate=args.cost_aggregate,
+            run_artifact_root=camera_dir,
         )
         if args.inference_mode == "async":
             worker = AsyncInferenceWorker(

@@ -44,6 +44,8 @@ class DriverConfig:
     use_lane_following: bool = False
     steer_gain_yaw: float = 0.8
     steer_gain_lat: float = 0.1
+    steer_speed_decay: float = 0.3
+    yaw_gain_smooth: bool = False
 
 
 class StraightLineDriver:
@@ -184,7 +186,17 @@ class StraightLineDriver:
         to_lane = lane_tf.location - veh_tf.location
         right = lane_tf.get_right_vector()
         cross_track = right.x * to_lane.x + right.y * to_lane.y + right.z * to_lane.z
-        steer = yaw_err_rad * self.cfg.steer_gain_yaw + cross_track * self.cfg.steer_gain_lat
+        vel = self.vehicle.get_velocity()
+        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+        decay = 1.0
+        if self.cfg.yaw_gain_smooth and self.cfg.steer_speed_decay > 0.0:
+            decay = 1.0 / (1.0 + self.cfg.steer_speed_decay * speed)
+        yaw_gain = self.cfg.steer_gain_yaw * decay
+        if self.cfg.yaw_gain_smooth:
+            lat_gain = self.cfg.steer_gain_lat * (0.5 + 0.5 * decay)
+        else:
+            lat_gain = self.cfg.steer_gain_lat
+        steer = yaw_err_rad * yaw_gain + cross_track * lat_gain
         return max(-1.0, min(1.0, steer))
 
     def _compute_control(self) -> carla.VehicleControl:
@@ -290,6 +302,17 @@ def parse_args() -> DriverConfig:
     parser.add_argument("--use-lane-following", action="store_true", help="Apply simple lane-following steering.")
     parser.add_argument("--steer-gain-yaw", type=float, default=0.8, help="Gain for yaw error in lane-follow steer.")
     parser.add_argument("--steer-gain-lat", type=float, default=0.1, help="Gain for lateral error in lane-follow steer.")
+    parser.add_argument(
+        "--steer-speed-decay",
+        type=float,
+        default=0.3,
+        help="Scale factor controlling how quickly steer gains decay with speed (higher => more decay).",
+    )
+    parser.add_argument(
+        "--yaw-gain-smooth",
+        action="store_true",
+        help="Enable speed-based smoothing for yaw gain / lateral gain blending.",
+    )
 
     args = parser.parse_args()
     return DriverConfig(
@@ -315,6 +338,8 @@ def parse_args() -> DriverConfig:
         use_lane_following=args.use_lane_following,
         steer_gain_yaw=args.steer_gain_yaw,
         steer_gain_lat=args.steer_gain_lat,
+        steer_speed_decay=args.steer_speed_decay,
+        yaw_gain_smooth=args.yaw_gain_smooth,
     )
 
 
