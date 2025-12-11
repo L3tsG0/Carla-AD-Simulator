@@ -190,16 +190,17 @@ def convert_to_host_path(path: Path, base_dir: Optional[Path] = None) -> Path:
     return path_obj.resolve()
 
 
-def update_pkl(template_pkl: Path, output_pkl: Path, image_paths: Dict[str, Dict[str, Path]]) -> None:
-    with open(template_pkl, "rb") as f:
-        data = pickle.load(f)
-    for sample in data["infos"]:
+def update_payload_images(payload: Dict[str, Any], image_paths: Dict[str, Dict[str, Path]]) -> Dict[str, Any]:
+    infos = payload.get("infos")
+    if not infos:
+        raise ValueError("Payload does not contain any infos entries.")
+    for sample in infos:
+        cams = sample.get("cams", {})
         for cam, paths in image_paths.items():
-            if cam not in sample["cams"]:
-                raise KeyError(f"{cam} not in PKL sample.")
-            sample["cams"][cam]["data_path"] = str(paths["container"])
-    with open(output_pkl, "wb") as f:
-        pickle.dump(data, f)
+            if cam not in cams:
+                raise KeyError(f"{cam} not in payload sample.")
+            cams[cam]["data_path"] = str(paths["container"])
+    return payload
 
 
 def _load_payload_builder():
@@ -251,6 +252,11 @@ def copy_payload_images(payload: Dict[str, Any], dest_dir: Path, base_dir: Path)
 def save_payload(payload: Dict[str, Any], output_pkl: Path) -> None:
     with output_pkl.open("wb") as f:
         pickle.dump(payload, f)
+
+
+def load_payload(path: Path) -> Dict[str, Any]:
+    with path.open("rb") as f:
+        return pickle.load(f)
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,7 +338,9 @@ def main() -> None:
             raise FileNotFoundError(f"Directory not found: {args.carla_dir}")
         camera_images = find_camera_images(args.carla_dir, args.frame_id, args.filename_template)
         saved_paths = convert_and_save(camera_images, args.output_image_dir)
-        update_pkl(args.template_pkl, args.output_pkl, saved_paths)
+        payload = load_payload(args.template_pkl)
+        update_payload_images(payload, saved_paths)
+        save_payload(payload, args.output_pkl)
 
         print("Generated:", args.output_pkl)
         for cam, paths in saved_paths.items():
@@ -347,7 +355,8 @@ def main() -> None:
         )
         host_base = base_dir if base_dir is not None else DRIVING_AGENT_ROOT
         saved_paths = copy_payload_images(payload, args.output_image_dir, host_base)
-        update_pkl(args.template_pkl, args.output_pkl, saved_paths)
+        update_payload_images(payload, saved_paths)
+        save_payload(payload, args.output_pkl)
 
         print(f"Generated: {args.output_pkl}")
         for cam, paths in saved_paths.items():

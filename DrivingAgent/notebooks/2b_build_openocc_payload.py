@@ -7,6 +7,7 @@ import math
 import pickle
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,15 @@ from DrivingAgent.src.camera_rig import CameraInstance, NuScenesCameraRig
 BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / "config" / ".env"
 CONFIG = EnvConfig(ENV_PATH)
+NUSCENES_FLIP = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,31 +78,63 @@ class OpenOccPayloadBuilder:
         self.payload_path_prefix = self.config.get("PAYLOAD_PATH_PREFIX", None)
 
     @staticmethod
-    def _euler_deg_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> List[float]:
-        roll = math.radians(roll_deg)
-        pitch = math.radians(pitch_deg)
-        yaw = math.radians(yaw_deg)
+    def _rotation_matrix_to_quaternion(matrix: np.ndarray) -> List[float]:
+        trace = float(np.trace(matrix))
+        if trace > 0.0:
+            s = 0.5 / math.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (matrix[2, 1] - matrix[1, 2]) * s
+            y = (matrix[0, 2] - matrix[2, 0]) * s
+            z = (matrix[1, 0] - matrix[0, 1]) * s
+        elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+            s = 2.0 * math.sqrt(max(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2], 1e-9))
+            w = (matrix[2, 1] - matrix[1, 2]) / s
+            x = 0.25 * s
+            y = (matrix[0, 1] + matrix[1, 0]) / s
+            z = (matrix[0, 2] + matrix[2, 0]) / s
+        elif matrix[1, 1] > matrix[2, 2]:
+            s = 2.0 * math.sqrt(max(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2], 1e-9))
+            w = (matrix[0, 2] - matrix[2, 0]) / s
+            x = (matrix[0, 1] + matrix[1, 0]) / s
+            y = 0.25 * s
+            z = (matrix[1, 2] + matrix[2, 1]) / s
+        else:
+            s = 2.0 * math.sqrt(max(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1], 1e-9))
+            w = (matrix[1, 0] - matrix[0, 1]) / s
+            x = (matrix[0, 2] + matrix[2, 0]) / s
+            y = (matrix[1, 2] + matrix[2, 1]) / s
+            z = 0.25 * s
+        quat = np.array([w, x, y, z], dtype=float)
+        norm = np.linalg.norm(quat)
+        if norm == 0.0:
+            return [1.0, 0.0, 0.0, 0.0]
+        quat /= norm
+        return quat.tolist()
 
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        cp = math.cos(pitch * 0.5)
-        sp = math.sin(pitch * 0.5)
-        cr = math.cos(roll * 0.5)
-        sr = math.sin(roll * 0.5)
+    @staticmethod
+    def _carla_to_nu_matrix(transform: carla.Transform) -> np.ndarray:
+        carla_matrix = np.array(transform.get_matrix(), dtype=float)
+        return NUSCENES_FLIP @ carla_matrix @ NUSCENES_FLIP
 
-        w = cr * cp * cy + sr * sp * sy
-        x = sr * cp * cy - cr * sp * sy
-        y = cr * sp * cy + sr * cp * sy
-        z = cr * cp * sy - sr * sp * cy
-        return [w, x, y, z]
+    @staticmethod
+    def _matrix_to_pose(matrix: np.ndarray) -> Dict[str, List[float]]:
+        translation = matrix[:3, 3].tolist()
+        rotation = OpenOccPayloadBuilder._rotation_matrix_to_quaternion(matrix[:3, :3])
+        return {
+            "translation": translation,
+            "rotation": rotation,
+        }
 
     def _transform_to_pose(self, transform: carla.Transform) -> Dict[str, List[float]]:
-        location = transform.location
-        rotation = transform.rotation
-        return {
-            "translation": [location.x, location.y, location.z],
-            "rotation": self._euler_deg_to_quaternion(rotation.roll, rotation.pitch, rotation.yaw),
-        }
+        matrix = self._carla_to_nu_matrix(transform)
+        return self._matrix_to_pose(matrix)
+
+    @staticmethod
+    def _safe_destroy_actor(actor: Optional[carla.Actor]) -> None:
+        if actor is None:
+            return
+        with suppress(RuntimeError, AttributeError):
+            actor.destroy()
 
     @staticmethod
     def _quat_to_rot_matrix(quat: List[float]) -> List[List[float]]:
@@ -200,30 +242,46 @@ class OpenOccPayloadBuilder:
         ego_pose: Dict[str, List[float]],
         image_path: Path,
         lidar_pose_matrix: np.ndarray,
+        static_calib: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        extrinsic = self._transform_to_pose(instance.config.transform)
-        sensor_matrix = self._pose_to_matrix(extrinsic)
-        sensor2lidar = np.linalg.inv(lidar_pose_matrix) @ sensor_matrix
-        sensor2lidar_rot = sensor2lidar[:3, :3]
-        sensor2lidar_trans = sensor2lidar[:3, 3]
+        if static_calib is not None:
+            sensor2ego_translation = static_calib.get("sensor2ego_translation")
+            sensor2ego_rotation = static_calib.get("sensor2ego_rotation")
+        else:
+            extrinsic = self._transform_to_pose(instance.config.transform)
+            sensor2ego_translation = extrinsic["translation"]
+            sensor2ego_rotation = extrinsic["rotation"]
+
+        if static_calib is not None and static_calib.get("sensor2lidar_translation") is not None:
+            sensor2lidar_trans = np.asarray(static_calib["sensor2lidar_translation"], dtype=float)
+            sensor2lidar_rot = np.asarray(static_calib.get("sensor2lidar_rotation"), dtype=float)
+        else:
+            sensor_matrix = self._pose_to_matrix(
+                {"translation": sensor2ego_translation, "rotation": sensor2ego_rotation}
+            )
+            sensor2lidar = np.linalg.inv(lidar_pose_matrix) @ sensor_matrix
+            sensor2lidar_rot = sensor2lidar[:3, :3]
+            sensor2lidar_trans = sensor2lidar[:3, 3]
+
+        intrinsic = static_calib.get("cam_intrinsic") if static_calib is not None else None
+        if intrinsic is None:
+            intrinsic = [
+                [1256.7414812095406, 0.0, 792.1125740759628],
+                [0.0, 1256.7414812095406, 492.7757465151356],
+                [0.0, 0.0, 1.0],
+            ]
+
         entry: Dict[str, Any] = {
             "data_path": self._format_data_path(image_path),
             "type": "camera",
-            "sensor2ego_translation": extrinsic["translation"],
-            "sensor2ego_rotation": extrinsic["rotation"],
+            "sensor2ego_translation": sensor2ego_translation,
+            "sensor2ego_rotation": sensor2ego_rotation,
             "sensor2lidar_translation": sensor2lidar_trans.tolist(),
             "sensor2lidar_rotation": sensor2lidar_rot.tolist(),
             "ego2global_translation": ego_pose["translation"],
             "ego2global_rotation": ego_pose["rotation"],
             "timestamp": int(time.time() * 1e6),
-            "cam_intrinsic": np.array(
-                [
-                    [1256.7414812095406, 0.0, 792.1125740759628],
-                    [0.0, 1256.7414812095406, 492.7757465151356],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=float,
-            ),
+            "cam_intrinsic": np.array(intrinsic, dtype=float),
             "resolution": [
                 int(instance.sensor.attributes.get("image_size_x", 0)),
                 int(instance.sensor.attributes.get("image_size_y", 0)),
@@ -297,16 +355,25 @@ class OpenOccPayloadBuilder:
             if post_capture_wait > 0:
                 time.sleep(post_capture_wait)
 
-            ego_pose = self._transform_to_pose(vehicle.get_transform())
+            ego_matrix = self._carla_to_nu_matrix(vehicle.get_transform())
+            ego_pose = self._matrix_to_pose(ego_matrix)
             lidar_transform = self._lidar_transform(dist_to_rear_axle)
-            lidar_pose = self._transform_to_pose(lidar_transform)
-            lidar_matrix = self._pose_to_matrix(lidar_pose)
+            lidar_matrix = self._carla_to_nu_matrix(lidar_transform)
+            lidar_pose = self._matrix_to_pose(lidar_matrix)
+            lidar_global_matrix = ego_matrix @ lidar_matrix
+            lidar_global_pose = self._matrix_to_pose(lidar_global_matrix)
+            bbox = vehicle.bounding_box
+            bbox_extent = bbox.extent
+            vehicle_half_extent = [float(bbox_extent.x), float(bbox_extent.y), float(bbox_extent.z)]
+            vehicle_size = [dim * 2.0 for dim in vehicle_half_extent]
+            template_cams = template_info.get("cams") if template_info and "cams" in template_info else None
             cams_dict = {}
             for instance in camera_instances:
                 image_dir = self.base_dir / "nuscenes_output" / instance.config.name
                 image_path = self._ensure_rgb(self._latest_image_path(image_dir))
+                static_calib = template_cams.get(instance.config.name) if template_cams else None
                 cams_dict[instance.config.name] = self._build_cam_entry(
-                    instance, ego_pose, image_path, lidar_matrix
+                    instance, ego_pose, image_path, lidar_matrix, static_calib=static_calib
                 )
 
             scene_token = f"scene-{uuid.uuid4().hex}"
@@ -326,11 +393,15 @@ class OpenOccPayloadBuilder:
                         "lidar_token": "",
                         "lidar2ego_translation": lidar_pose["translation"],
                         "lidar2ego_rotation": lidar_pose["rotation"],
+                        "lidar2global_translation": lidar_global_pose["translation"],
+                        "lidar2global_rotation": lidar_global_pose["rotation"],
                         "lidarseg": "",
                         "prev": "",
                         "next": "",
                         "sweeps": [],
                         "can_bus": self._build_can_bus(ego_pose),
+                        "carla_vehicle_extent": vehicle_half_extent,
+                        "carla_vehicle_size": vehicle_size,
                     }
                 ],
                 "metadata": {"version": "carla"},
@@ -340,10 +411,10 @@ class OpenOccPayloadBuilder:
             return payload
         finally:
             if camera_rig:
-                camera_rig.destroy()
+                with suppress(RuntimeError, AttributeError):
+                    camera_rig.destroy()
             for actor in actor_list:
-                if actor.is_alive:
-                    actor.destroy()
+                self._safe_destroy_actor(actor)
 
     @staticmethod
     def make_pkl(payload: Dict[str, Any], path: Path) -> None:
