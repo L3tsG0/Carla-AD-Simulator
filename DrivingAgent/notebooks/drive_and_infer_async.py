@@ -285,6 +285,12 @@ def parse_args() -> argparse.Namespace:
         help="JSON mapping class id to weight for costmap generation (passed to OccupancyCostmapPipeline).",
     )
     parser.add_argument(
+        "--attack-config",
+        type=Path,
+        default=None,
+        help="Optional AttackSimulator config (JSON or YAML) applied before costmap generation.",
+    )
+    parser.add_argument(
         "--cost-aggregate",
         choices=["sum", "max"],
         default="sum",
@@ -382,6 +388,7 @@ def main() -> None:
             workspace_root=args.workspace_root,
             class_weight_json=args.class_weight_json,
             cost_aggregate=args.cost_aggregate,
+            attack_config=args.attack_config,
             run_artifact_root=camera_dir,
         )
         if args.inference_mode == "async":

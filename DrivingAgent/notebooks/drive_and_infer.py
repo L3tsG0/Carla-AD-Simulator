@@ -113,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Capture frames but skip calls to the inference API and costmap generation.",
     )
+    parser.add_argument(
+        "--attack-config",
+        type=Path,
+        default=None,
+        help="Optional AttackSimulator config applied before costmap generation.",
+    )
     return parser.parse_args()
 
 
@@ -166,6 +172,7 @@ def main() -> None:
         notebooks_dir=notebooks_dir,
         api_url=args.api_url,
         workspace_root=args.workspace_root,
+        attack_config=args.attack_config,
     )
     print("Running inference on recorded frames...")
     for frame in captured_frames:

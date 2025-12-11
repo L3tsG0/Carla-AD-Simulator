@@ -33,6 +33,292 @@ class PipelineResult:
     front_camera_image_path: Optional[Path] = None
 
 
+class AttackSimulator:
+    """Apply adversarial occupancy edits such as hiding or appearing cars."""
+
+    def __init__(self, config: Dict[str, Any], *, tmp_dir: Path) -> None:
+        self.config = dict(config)
+        self.mode = str(self.config.get("mode", "none")).lower()
+        self.target_class_id = int(self.config.get("target_class_id", self.config.get("class_id", 4)))
+        self.hide_probability = float(self.config.get("hide_probability", self.config.get("probability", 0.0)))
+        self.hide_fill_class_id = int(self.config.get("hide_fill_class_id", self.config.get("fill_class_id", 0)))
+        self.appear_probability = float(self.config.get("appear_probability", self.config.get("probability", 0.0)))
+        self.anchor_distance_m = float(self.config.get("appear_distance_m", self.config.get("anchor_distance_m", 20.0)))
+        box = self.config.get("appear_box_m", self.config.get("box_size_m", [4.72, 1.85, 1.44]))
+        if not isinstance(box, (list, tuple)) or len(box) != 3:
+            box = [4.72, 1.85, 1.44]
+        self.appear_box_m = tuple(float(v) for v in box)
+        self.anchor_height_offset = float(self.config.get("anchor_height_offset_m", 0.0))
+        self.anchor_mode = str(self.config.get("anchor_mode", "relative_follow")).lower()
+        override = self.config.get("anchor_global")
+        self.anchor_override = (
+            np.asarray(override, dtype=np.float32) if isinstance(override, (list, tuple)) and len(override) == 3 else None
+        )
+        forward_axis = self.config.get("forward_axis")
+        if isinstance(forward_axis, (list, tuple)) and len(forward_axis) == 3:
+            vec = np.asarray(forward_axis, dtype=np.float32)
+        else:
+            vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        if norm == 0.0:
+            vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            norm = 1.0
+        self.forward_axis = vec / norm
+        self.xy_downsample = float(self.config.get("grid_xy_downsample", self.config.get("xy_downsample", 4.0)))
+        if self.xy_downsample <= 0.0:
+            self.xy_downsample = 1.0
+        axis_tokens = self.config.get("grid_axis_order", ["x", "y", "z"])
+        if isinstance(axis_tokens, str):
+            axis_tokens = [axis_tokens]
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        parsed: List[int] = []
+        for token in axis_tokens:
+            token_lower = str(token).lower()
+            idx = axis_map.get(token_lower)
+            if idx is not None and idx not in parsed:
+                parsed.append(idx)
+        if len(parsed) != 3:
+            parsed = [axis_map["x"], axis_map["y"], axis_map["z"]]
+        self.axis_indices = tuple(parsed)
+        self.tmp_dir = Path(tmp_dir)
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        seed = self.config.get("seed")
+        self.rng = np.random.default_rng(seed)
+        self._fixed_anchor_global: Optional[np.ndarray] = None
+        self._last_ego_global: Optional[np.ndarray] = None
+        self._cumulative_travel_m: float = 0.0
+        self.tick_seconds = float(self.config.get("tick_seconds", 0.1))
+
+    @staticmethod
+    def load_from_path(path: Path, *, tmp_dir: Path) -> "AttackSimulator":
+        config = AttackSimulator._read_config(path)
+        return AttackSimulator(config, tmp_dir=tmp_dir)
+
+    @staticmethod
+    def _read_config(path: Path) -> Dict[str, Any]:
+        path = Path(path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Attack config not found: {path}")
+        try:
+            if path.suffix in {".yml", ".yaml"}:
+                try:
+                    import yaml  # type: ignore
+                except ImportError as exc:  # pragma: no cover - optional dependency guard
+                    raise RuntimeError("PyYAML is required to parse YAML attack configs.") from exc
+                with path.open("r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh)
+            else:
+                with path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+        except Exception as exc:  # pragma: no cover - config parsing guard
+            raise RuntimeError(f"Failed to parse attack config {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Attack config {path} must be a mapping.")
+        return data
+
+    def apply(
+        self,
+        prediction_path: Path,
+        payload_info: Optional[Dict[str, Any]],
+        occ_size: Optional[List[int]],
+        pc_range: Optional[List[float]],
+    ) -> Path:
+        if self.mode == "none":
+            return prediction_path
+        grid = np.load(prediction_path)
+        changed = False
+        if self.mode == "hide":
+            changed = self._apply_hiding(grid)
+        elif self.mode == "appear":
+            changed = self._apply_appearing(grid, payload_info, pc_range, occ_size)
+        if not changed:
+            return prediction_path
+        attacked_path = self._write_attacked(prediction_path, grid)
+        return attacked_path
+
+    def _apply_hiding(self, grid: np.ndarray) -> bool:
+        if self.hide_probability <= 0.0 or grid.ndim < 3:
+            return False
+        mask = grid == self.target_class_id
+        total = int(mask.sum())
+        if total == 0:
+            return False
+        take = int(round(total * self.hide_probability))
+        if take <= 0:
+            return False
+        take = min(total, take)
+        flat_indices = np.flatnonzero(mask)
+        if flat_indices.size == 0:
+            return False
+        selected = self.rng.choice(flat_indices, size=take, replace=False)
+        flat_grid = grid.reshape(-1)
+        flat_grid[selected] = self.hide_fill_class_id
+        return True
+
+    def _apply_appearing(
+        self,
+        grid: np.ndarray,
+        payload_info: Optional[Dict[str, Any]],
+        pc_range: Optional[List[float]],
+        occ_size: Optional[List[int]],
+    ) -> bool:
+        if self.appear_probability <= 0.0 or grid.ndim < 3:
+            return False
+        if pc_range is None or payload_info is None:
+            print("[AttackSimulator] Appearing attack requires payload info and pc_range.")
+            return False
+        anchor_global = self._resolve_anchor_global(payload_info)
+        if anchor_global is None:
+            return False
+        anchor_lidar = self._global_to_lidar(payload_info, anchor_global)
+        if anchor_lidar is None:
+            return False
+        grid_shape = np.array(grid.shape[:3], dtype=np.float32)
+        mins_raw = np.asarray(pc_range[:3], dtype=np.float32)
+        spans_raw = np.asarray(pc_range[3:6], dtype=np.float32) - mins_raw
+        spans_raw[spans_raw == 0] = 1.0
+        order = np.array(self.axis_indices, dtype=np.int64)
+        mins = mins_raw[order]
+        spans = spans_raw[order]
+        anchor_aligned = anchor_lidar[order]
+        if occ_size and len(occ_size) >= 3:
+            reference_shape = np.array(occ_size[:3], dtype=np.float32)[order]
+        else:
+            reference_shape = grid_shape.copy()
+        reference_shape[reference_shape <= 0.0] = 1.0
+        voxel_sizes_ref = spans / reference_shape
+        center = (anchor_aligned - mins) / voxel_sizes_ref
+        scale = grid_shape / reference_shape
+        center *= scale
+        if np.any(np.isnan(center)):
+            return False
+        center = np.clip(center, 0.0, grid_shape - 1.0)
+        box_dims_world = np.maximum(np.asarray(self.appear_box_m, dtype=np.float32), 1e-3)
+        box_dims = box_dims_world[order]
+        half_extents = box_dims / (2.0 * voxel_sizes_ref)
+        half_extents *= scale
+        if self.xy_downsample != 1.0:
+            center[:2] = center[:2] / self.xy_downsample
+            half_extents[:2] = half_extents[:2] / self.xy_downsample
+        min_idx = np.maximum(np.floor(center - half_extents), 0.0).astype(int)
+        max_idx = np.minimum(np.ceil(center + half_extents).astype(int) + 1, grid_shape.astype(int))
+        x0, y0, z0 = min_idx.tolist()
+        x1, y1, z1 = max_idx.tolist()
+        if x0 >= x1 or y0 >= y1 or z0 >= z1:
+            return False
+        region = grid[x0:x1, y0:y1, z0:z1]
+        random_mask = self.rng.random(region.shape) < self.appear_probability
+        if not random_mask.any():
+            return False
+        region[random_mask] = self.target_class_id
+        grid[x0:x1, y0:y1, z0:z1] = region
+        return True
+
+    def _resolve_anchor_global(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        if self.anchor_override is not None:
+            return self.anchor_override
+        if self.anchor_mode in {"relative_follow", "follow", "moving"}:
+            anchor = self._compute_follow_anchor(payload_info)
+            if anchor is not None:
+                return anchor
+        candidate = self._compute_forward_anchor(payload_info)
+        if candidate is None:
+            return None
+        if self.anchor_mode in {"relative_start", "fixed_start"}:
+            if self._fixed_anchor_global is None:
+                self._fixed_anchor_global = candidate
+            return self._fixed_anchor_global
+        return candidate
+
+    def _compute_forward_anchor(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        forward = self._get_forward_vector(payload_info)
+        ego_trans = payload_info.get("ego2global_translation")
+        if forward is None or ego_trans is None:
+            return None
+        origin = np.asarray(ego_trans, dtype=np.float32)
+        anchor = origin + forward * float(self.anchor_distance_m)
+        anchor[2] += self.anchor_height_offset
+        return anchor
+
+    def _compute_follow_anchor(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        forward = self._get_forward_vector(payload_info)
+        ego_trans = payload_info.get("ego2global_translation")
+        if forward is None or ego_trans is None:
+            return None
+        ego_global = np.asarray(ego_trans, dtype=np.float32)
+        if self._last_ego_global is None:
+            self._last_ego_global = ego_global
+            self._cumulative_travel_m = 0.0
+            anchor = ego_global + forward * float(self.anchor_distance_m)
+            anchor[2] += self.anchor_height_offset
+            return anchor
+        travel = self._estimate_forward_travel(ego_global, forward, payload_info)
+        if travel > 0.0:
+            self._cumulative_travel_m += travel
+        self._last_ego_global = ego_global
+        remaining = max(0.0, float(self.anchor_distance_m) - self._cumulative_travel_m)
+        anchor = ego_global + forward * remaining
+        anchor[2] += self.anchor_height_offset
+        return anchor
+
+    def _estimate_forward_travel(
+        self, ego_global: np.ndarray, forward: np.ndarray, payload_info: Dict[str, Any]
+    ) -> float:
+        travel = 0.0
+        if self._last_ego_global is not None:
+            delta = ego_global - self._last_ego_global
+            travel = abs(float(np.dot(delta, forward)))
+        if abs(travel) < 1e-3:
+            can_bus = payload_info.get("can_bus")
+            if isinstance(can_bus, (list, tuple, np.ndarray)) and len(can_bus) >= 10:
+                vel = np.asarray(can_bus[7:9], dtype=np.float32)
+                vel_vec = np.array([vel[0], vel[1], 0.0], dtype=np.float32)
+                travel = abs(float(np.dot(vel_vec, forward)) * float(self.tick_seconds))
+        return max(0.0, travel)
+
+    def _get_forward_vector(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        ego_rot = payload_info.get("ego2global_rotation")
+        if ego_rot is None:
+            return None
+        try:
+            rot = OccupancyCostmapPipeline._quaternion_to_matrix(ego_rot)
+        except Exception:
+            return None
+        forward = rot @ self.forward_axis
+        norm = float(np.linalg.norm(forward))
+        if norm == 0.0:
+            return None
+        return forward / norm
+
+    def _global_to_lidar(self, payload_info: Dict[str, Any], point_global: np.ndarray) -> Optional[np.ndarray]:
+        ego_rot = payload_info.get("ego2global_rotation")
+        ego_trans = payload_info.get("ego2global_translation")
+        lidar_rot = payload_info.get("lidar2ego_rotation")
+        lidar_trans = payload_info.get("lidar2ego_translation")
+        if None in (ego_rot, ego_trans, lidar_rot, lidar_trans):
+            return None
+        try:
+            ego_rot = OccupancyCostmapPipeline._quaternion_to_matrix(ego_rot)
+            lidar_rot = OccupancyCostmapPipeline._quaternion_to_matrix(lidar_rot)
+        except Exception:
+            return None
+        ego_trans = np.asarray(ego_trans, dtype=np.float32)
+        lidar_trans = np.asarray(lidar_trans, dtype=np.float32)
+        point_ego = ego_rot.T @ (point_global - ego_trans)
+        point_lidar = lidar_rot.T @ (point_ego - lidar_trans)
+        return point_lidar
+
+    def _write_attacked(self, source_path: Path, grid: np.ndarray) -> Path:
+        timestamp = int(time.time() * 1000)
+        dest = self.tmp_dir / f"{source_path.stem}_attack_{timestamp}{source_path.suffix}"
+        counter = 1
+        while dest.exists():
+            dest = self.tmp_dir / f"{source_path.stem}_attack_{timestamp}_{counter}{source_path.suffix}"
+            counter += 1
+        np.save(dest, grid)
+        return dest
+
+
 class OccupancyCostmapPipeline:
     """Run CARLA capture -> OpenOccupancy inference -> costmap generation in one call."""
 
@@ -48,6 +334,7 @@ class OccupancyCostmapPipeline:
         default_pc_range: Optional[List[float]] = None,
         class_weight_json: Optional[Path] = None,
         cost_aggregate: str = "sum",
+        attack_config: Optional[Path] = None,
         run_artifact_root: Optional[Path] = None,
     ) -> None:
         self.notebooks_dir = notebooks_dir
@@ -72,6 +359,14 @@ class OccupancyCostmapPipeline:
         self.default_pc_range = default_pc_range or [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.class_weights = self._load_class_weights(class_weight_json)
         self.cost_aggregate = cost_aggregate
+        self.attack_simulator: Optional[AttackSimulator] = None
+        if attack_config is not None:
+            try:
+                self.attack_simulator = AttackSimulator.load_from_path(attack_config, tmp_dir=self.tmp_dir)
+                print(f"[AttackSimulator] Loaded config from {attack_config}")
+            except Exception as exc:
+                print(f"[AttackSimulator] Failed to initialize ({exc}); attacks disabled.")
+                self.attack_simulator = None
 
         # Ensure OpenOccupancy is importable for the costmap utility.
         if str(self.workspace_root) not in sys.path:
@@ -561,6 +856,22 @@ class OccupancyCostmapPipeline:
         if not enable_inference:
             return PipelineResult(payload_path=payload)
         prediction, occ_size, pc_range = self.request_inference(payload)
+        if self.attack_simulator is not None:
+            payload_info = None
+            try:
+                payload_info = self._load_payload_info(payload)
+            except Exception as exc:
+                print(f"[AttackSimulator] Failed to load payload info ({exc}); skipping attack.")
+            if payload_info is not None:
+                try:
+                    prediction = self.attack_simulator.apply(
+                        prediction_path=prediction,
+                        payload_info=payload_info,
+                        occ_size=occ_size,
+                        pc_range=pc_range or self.default_pc_range,
+                    )
+                except Exception as exc:
+                    print(f"[AttackSimulator] Attack application failed: {exc}")
         if occ_size is None:
             try:
                 occ_size = self._infer_occ_size_from_npy(prediction)
@@ -644,6 +955,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON mapping class id to weight for costmap generation (keys can be id or {id: {weight}}).",
     )
+    parser.add_argument(
+        "--attack-config",
+        type=Path,
+        default=None,
+        help="Optional JSON/YAML config describing the AttackSimulator behavior.",
+    )
     return parser.parse_args()
 
 
@@ -659,6 +976,7 @@ def main() -> None:
         default_occ_size=args.occ_size,
         default_pc_range=args.pc_range,
         class_weight_json=args.class_weight_json,
+        attack_config=args.attack_config,
     )
     result = pipeline.run_once(
         spawn_index=args.spawn_index,

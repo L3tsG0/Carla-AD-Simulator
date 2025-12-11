@@ -1,0 +1,9 @@
+mode: appear
+target_class_id: 4
+probability: 1.0
+anchor_mode: relative_start
+appear_distance_m: 15.0
+appear_box_m: [4.72, 1.85, 1.44]
+grid_xy_downsample: 4.0
+grid_axis_order: [y, x, z]
+forward_axis: [0.0, 1.0, 0.0]
