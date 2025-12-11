@@ -95,11 +95,6 @@ class StraightLineDriver:
         vehicle = self.world.spawn_actor(blueprint, spawn_transform)
         return vehicle
 
-    @staticmethod
-    def _current_speed(vehicle: carla.Vehicle) -> float:
-        velocity = vehicle.get_velocity()
-        return math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-
     def _apply_control(self, vehicle: carla.Vehicle, throttle: float, brake: float) -> None:
         control = carla.VehicleControl()
         control.throttle = max(0.0, min(1.0, throttle))
@@ -193,8 +188,12 @@ class StraightLineDriver:
         return max(-1.0, min(1.0, steer))
 
     def _compute_control(self) -> carla.VehicleControl:
-        speed = self._current_speed(self.vehicle)
-        error = self.cfg.target_speed_mps - speed
+        vel = self.vehicle.get_velocity()
+        fwd = self.vehicle.get_transform().get_forward_vector()
+        fwd_speed = vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z  # signed speed along heading
+        if abs(fwd_speed) < 0.05:  # deadband to suppress tiny drift
+            fwd_speed = 0.0
+        error = self.cfg.target_speed_mps - fwd_speed
         if error >= 0:
             throttle = error * self.cfg.acceleration_gain
             brake = 0.0

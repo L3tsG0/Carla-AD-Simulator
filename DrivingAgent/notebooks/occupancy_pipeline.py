@@ -44,6 +44,8 @@ class OccupancyCostmapPipeline:
         post_capture_wait: float = 0.5,
         default_occ_size: Optional[List[int]] = None,
         default_pc_range: Optional[List[float]] = None,
+        class_weight_json: Optional[Path] = None,
+        cost_aggregate: str = "sum",
     ) -> None:
         self.notebooks_dir = notebooks_dir
         self.api_url = api_url
@@ -60,6 +62,8 @@ class OccupancyCostmapPipeline:
         self.post_capture_wait = post_capture_wait
         self.default_occ_size = default_occ_size or [512, 512, 40]
         self.default_pc_range = default_pc_range or [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        self.class_weights = self._load_class_weights(class_weight_json)
+        self.cost_aggregate = cost_aggregate
 
         # Ensure OpenOccupancy is importable for the costmap utility.
         if str(self.workspace_root) not in sys.path:
@@ -78,6 +82,28 @@ class OccupancyCostmapPipeline:
             counter += 1
         shutil.copy2(source, dest)
         return dest
+
+    @staticmethod
+    def _load_class_weights(path: Optional[Path]) -> Optional[dict[int, float]]:
+        if path is None:
+            return None
+        try:
+            with Path(path).open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            weights = {}
+            for k, v in data.items():
+                try:
+                    cls_id = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(v, dict) and "weight" in v:
+                    weights[cls_id] = float(v["weight"])
+                elif isinstance(v, (int, float)):
+                    weights[cls_id] = float(v)
+            return weights if weights else None
+        except Exception as exc:  # pragma: no cover
+            print(f"[Costmap] Failed to load class weights from {path}: {exc}")
+            return None
 
     @staticmethod
     def _load_payload_info(payload_path: Path) -> Dict[str, Any]:
@@ -344,26 +370,53 @@ class OccupancyCostmapPipeline:
         except Exception:
             ego_center = None
 
-        cost_gen = CostmapGenerator(reduce="max", normalize=True)
+        # If class weights provided, apply them before projection.
+        cost_gen = None
+        if self.class_weights:
+            weights_arr = np.ones_like(grid, dtype=np.float32)
+            for cls_id, w in self.class_weights.items():
+                mask = grid == cls_id
+                if np.any(mask):
+                    weights_arr[mask] = float(w)
+            weighted = weights_arr
+        else:
+            weighted = (grid != 0).astype(np.float32)
 
-        # Full costmap
-        full_cost = cost_gen.make_topdown_costmap(grid)
+        # Projection to 2D:
+        # - with class weights: aggregate along Z directly (sum or max)
+        # - without weights: use CostmapGenerator reduce=(sum|max)/normalize=False
+        agg = self.cost_aggregate.lower()
+        if agg not in {"sum", "max"}:
+            raise ValueError(f"Unsupported cost_aggregate={self.cost_aggregate}")
+        if self.class_weights:
+            if agg == "sum":
+                full_cost = weighted.sum(axis=2)
+            else:
+                full_cost = weighted.max(axis=2)
+        else:
+            cost_gen = CostmapGenerator(reduce=agg, normalize=False)
+            full_cost = cost_gen.make_topdown_costmap(weighted)
         output_full.parent.mkdir(parents=True, exist_ok=True)
         np.save(output_full, full_cost.astype(np.float32))
-        # Keep image aligned with the ego-centered window for downstream viewing.
 
         # Ego-centered crop (window)
-        # Notebook parity: fixed crop size (64, 64).
         crop_dim = (min(64, grid_xy[0]), min(64, grid_xy[1]))
-
-        window_cost, window_bounds = cost_gen.generate(
-            grid,
-            center_xy_idx=ego_center,
-            crop_size_xy=crop_dim,
-        )
+        if ego_center is None:
+            window_cost = full_cost
+            window_bounds = (0, full_cost.shape[0], 0, full_cost.shape[1])
+        else:
+            cx, cy = np.round(ego_center).astype(np.int64)
+            hx, hy = int(crop_dim[0]) // 2, int(crop_dim[1]) // 2
+            x0 = int(max(0, cx - hx))
+            x1 = int(min(full_cost.shape[0], cx + hx))
+            y0 = int(max(0, cy - hy))
+            y1 = int(min(full_cost.shape[1], cy + hy))
+            window_cost = full_cost[x0:x1, y0:y1]
+            window_bounds = (x0, x1, y0, y1)
 
         np.save(output_window, window_cost.astype(np.float32))
-        cost_gen.save_costmap(window_cost, output_image)
+        # Use static method to save (avoids needing cost_gen when weights are used)
+        CostmapGenerator.save_costmap(window_cost, output_image)
 
         result = PipelineResult(
             payload_path=payload_path,
@@ -518,6 +571,12 @@ def parse_args() -> argparse.Namespace:
             "{cam_short}, {frame})."
         ),
     )
+    parser.add_argument(
+        "--class-weight-json",
+        type=Path,
+        default=None,
+        help="JSON mapping class id to weight for costmap generation (keys can be id or {id: {weight}}).",
+    )
     return parser.parse_args()
 
 
@@ -532,6 +591,7 @@ def main() -> None:
         post_capture_wait=args.post_capture_wait,
         default_occ_size=args.occ_size,
         default_pc_range=args.pc_range,
+        class_weight_json=args.class_weight_json,
     )
     result = pipeline.run_once(
         spawn_index=args.spawn_index,

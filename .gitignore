@@ -6,3 +6,5 @@
 *.pkl
 *.pyc
 __pychache__
+DrivingAgent/data
+DrivingAgent/notebooks/tmp/pipeline/
