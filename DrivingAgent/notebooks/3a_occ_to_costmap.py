@@ -178,6 +178,7 @@ def recenter_costmap(
 def compute_config_center(
     cost_shape: Tuple[int, int],
     occ_size: Optional[Sequence[int]],
+    pc_range: Optional[Sequence[float]] = None,
 ) -> Optional[Tuple[float, float]]:
     if not occ_size or len(occ_size) < 2:
         return None
@@ -186,9 +187,101 @@ def compute_config_center(
         return None
     scale_row = cost_shape[0] / occ_h
     scale_col = cost_shape[1] / occ_w
+
+    if pc_range and len(pc_range) >= 4:
+        x_min, y_min = float(pc_range[0]), float(pc_range[1])
+        x_max, y_max = float(pc_range[3]), float(pc_range[4])
+        span_x = x_max - x_min
+        span_y = y_max - y_min
+        if span_x > 0 and span_y > 0:
+            voxel_x = span_x / occ_h
+            voxel_y = span_y / occ_w
+            # determine which voxel contains ego origin (0,0)
+            row_idx = ((0.0 - x_min) / voxel_x) - 0.5
+            col_idx = ((0.0 - y_min) / voxel_y) - 0.5
+            row_idx = max(0.0, min(occ_h - 1.0, row_idx))
+            col_idx = max(0.0, min(occ_w - 1.0, col_idx))
+            target_row = row_idx * scale_row
+            target_col = col_idx * scale_col
+            return (target_row, target_col)
+
     target_row = ((occ_h - 1.0) / 2.0) * scale_row
     target_col = ((occ_w - 1.0) / 2.0) * scale_col
     return (target_row, target_col)
+
+
+def _quaternion_to_matrix(quat: Sequence[float]) -> np.ndarray:
+    if len(quat) != 4:
+        raise ValueError(f"Quaternion must have 4 elements, got {quat}")
+    w, x, y, z = quat
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm == 0:
+        raise ValueError("Quaternion has zero magnitude.")
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def load_ego_center_from_payload(
+    path: Path,
+    occ_size: Optional[Sequence[int]] = None,
+    pc_range: Optional[Sequence[float]] = None,
+    sample_index: int = 0,
+) -> Tuple[float, float]:
+    if not path.exists():
+        raise FileNotFoundError(f"Payload file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as f:
+            payload = pickle.load(f)
+    else:
+        payload = json.loads(path.read_text())
+
+    infos = _extract_infos(payload)
+    if not infos:
+        raise ValueError("Payload contains no infos entries.")
+    if not 0 <= sample_index < len(infos):
+        raise IndexError(f"Sample index {sample_index} out of range (len={len(infos)}).")
+    info = infos[sample_index]
+    lidar2ego_trans = info.get("lidar2ego_translation")
+    lidar2ego_rot = info.get("lidar2ego_rotation")
+    if lidar2ego_trans is None or lidar2ego_rot is None:
+        raise ValueError("Payload sample lacks lidar2ego transformation.")
+
+    lidar2ego_rot = _quaternion_to_matrix(lidar2ego_rot)
+    lidar2ego_trans = np.array(lidar2ego_trans, dtype=np.float32)
+    ego_center_lidar = -lidar2ego_rot.T @ lidar2ego_trans
+
+    if occ_size is None:
+        occ_size = info.get("occ_size")
+        if occ_size is None:
+            raise ValueError("--occ-size not provided and payload lacks occ_size.")
+    if pc_range is None:
+        pc_range = info.get("pc_range") or info.get("point_cloud_range")
+        if pc_range is None:
+            raise ValueError("--pc-range not provided and payload lacks pc_range.")
+
+    occ_arr = np.asarray(occ_size, dtype=np.float32)
+    pc_range_arr = np.asarray(pc_range, dtype=np.float32)
+    if occ_arr.shape[0] < 2 or pc_range_arr.shape[0] < 6:
+        raise ValueError("Invalid occ_size or pc_range for ego center computation.")
+
+    voxel_span = pc_range_arr[3:6] - pc_range_arr[0:3]
+    voxel_span[voxel_span == 0] = 1.0
+    voxel_size = voxel_span / occ_arr
+    voxel_size[voxel_size == 0] = 1.0
+
+    row_idx = (ego_center_lidar[0] - pc_range_arr[0]) / voxel_size[0]
+    col_idx = (ego_center_lidar[1] - pc_range_arr[1]) / voxel_size[1]
+    row_idx = float(np.clip(row_idx, 0.0, occ_arr[0] - 1.0))
+    col_idx = float(np.clip(col_idx, 0.0, occ_arr[1] - 1.0))
+    return row_idx, col_idx
 
 
 def _extract_infos(payload: Any) -> List[Dict[str, Any]]:
@@ -234,6 +327,26 @@ def load_ego_yaw_from_payload(path: Path, sample_index: int = 0) -> float:
             yaw += 360.0
         return yaw
 
+def load_occ_params_from_payload(
+    path: Path, sample_index: int = 0
+) -> Tuple[Optional[Sequence[int]], Optional[Sequence[float]]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Payload file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as f:
+            payload = pickle.load(f)
+    else:
+        payload = json.loads(path.read_text())
+    infos = _extract_infos(payload)
+    if not infos:
+        raise ValueError("Payload contains no infos entries.")
+    if not 0 <= sample_index < len(infos):
+        raise IndexError(f"Sample index {sample_index} out of range (len={len(infos)}).")
+    info = infos[sample_index]
+    occ_size = info.get("occ_size")
+    pc_range = info.get("pc_range") or info.get("point_cloud_range")
+    return occ_size, pc_range
     raise ValueError("Selected sample does not contain yaw information.")
 
 
@@ -429,6 +542,18 @@ def parse_args() -> argparse.Namespace:
         help="Sample index used together with --ego-yaw-from-payload.",
     )
     parser.add_argument(
+        "--ego-center-from-payload",
+        type=Path,
+        default=None,
+        help="Payload file used to extract ego center for recentering.",
+    )
+    parser.add_argument(
+        "--ego-center-sample-index",
+        type=int,
+        default=0,
+        help="Sample index used together with --ego-center-from-payload.",
+    )
+    parser.add_argument(
         "--pc-range",
         nargs=6,
         type=float,
@@ -456,6 +581,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     grid = np.load(args.input)
+    if grid.ndim < 3:
+        raise ValueError(f"Expected occupancy grid with at least 3 dims, got shape {grid.shape}")
+    inferred_occ_size = [int(grid.shape[0]), int(grid.shape[1]), int(grid.shape[2])]
+    occ_size = list(args.occ_size) if args.occ_size else inferred_occ_size
     class_weights = parse_class_weights(
         obstacle_classes=args.obstacle_classes,
         ignore_classes=args.ignore_classes,
@@ -468,10 +597,40 @@ def main() -> None:
     cost_map = project_costmap(grid, class_weights, aggregate=args.aggregate)
     config_center = None
     if args.recenter == "ego":
-        config_center = compute_config_center(cost_map.shape[:2], args.occ_size)
+        pc_range = args.pc_range
+        if args.ego_center_from_payload:
+            payload_occ, payload_pc_range = load_occ_params_from_payload(
+                args.ego_center_from_payload, sample_index=args.ego_center_sample_index
+            )
+            if args.occ_size is None and payload_occ is not None:
+                occ_size = list(payload_occ)
+            if pc_range is None:
+                pc_range = payload_pc_range
+            if occ_size is None or pc_range is None:
+                raise ValueError(
+                    "--occ-size and --pc-range are required when using --ego-center-from-payload "
+                    "if the payload lacks these fields."
+                )
+            payload_row, payload_col = load_ego_center_from_payload(
+                args.ego_center_from_payload,
+                occ_size,
+                pc_range,
+                sample_index=args.ego_center_sample_index,
+            )
+            occ_h, occ_w = float(occ_size[0]), float(occ_size[1])
+            scale_row = cost_map.shape[0] / occ_h
+            scale_col = cost_map.shape[1] / occ_w
+            config_center = (payload_row * scale_row, payload_col * scale_col)
+        if config_center is None:
+            config_center = compute_config_center(cost_map.shape[:2], occ_size, pc_range)
     recentered_shift = (0, 0)
     if args.recenter != "none":
         cost_map, recentered_shift = recenter_costmap(cost_map, args.recenter, config_center=config_center)
+
+    # Align 2D cost map axes with the 3D visualization convention.
+    # Projected grid uses (row=x, col=y); transpose + flip makes forward (+x) point right.
+    cost_map = np.flipud(cost_map.T)
+
     if args.align_carla_y:
         cost_map = np.fliplr(cost_map)
     if args.rotate_degrees:
@@ -527,7 +686,9 @@ def main() -> None:
             "ego_yaw_payload": str(args.ego_yaw_from_payload) if args.ego_yaw_from_payload else None,
             "ego_yaw_sample_index": args.ego_yaw_sample_index if args.ego_yaw_from_payload else None,
             "pc_range": args.pc_range,
-            "occ_size": args.occ_size,
+            "occ_size": occ_size,
+            "ego_center_payload": str(args.ego_center_from_payload) if args.ego_center_from_payload else None,
+            "ego_center_sample_index": args.ego_center_sample_index if args.ego_center_from_payload else None,
         }
         args.dump_config.parent.mkdir(parents=True, exist_ok=True)
         args.dump_config.write_text(json.dumps(summary, indent=2), encoding="utf-8")

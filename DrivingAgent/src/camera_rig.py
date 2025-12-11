@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List
 import queue
 import threading
+from contextlib import suppress
 
 import carla
 
@@ -189,7 +190,11 @@ class NuScenesCameraRig:
         """Destroy spawned sensors."""
 
         for sensor in self._sensors:
-            if sensor.is_alive:
+            if sensor is None:
+                continue
+            with suppress(RuntimeError, AttributeError):
+                sensor.stop()
+            with suppress(RuntimeError, AttributeError):
                 sensor.destroy()
         self._sensors.clear()
         self._save_worker.stop()
