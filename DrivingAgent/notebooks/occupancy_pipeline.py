@@ -52,6 +52,12 @@ class AttackSimulator:
         self.appear_box_m = tuple(float(v) for v in box)
         self.anchor_height_offset = float(self.config.get("anchor_height_offset_m", 0.0))
         self.anchor_mode = str(self.config.get("anchor_mode", "relative_follow")).lower()
+        self.speed_trigger_mps = float(
+            self.config.get("appear_speed_trigger_mps", self.config.get("speed_trigger_mps", 0.0))
+        )
+        self.speed_trigger_once = bool(
+            self.config.get("appear_speed_trigger_once", self.config.get("speed_trigger_once", True))
+        )
         override = self.config.get("anchor_global")
         self.anchor_override = (
             np.asarray(override, dtype=np.float32) if isinstance(override, (list, tuple)) and len(override) == 3 else None
@@ -91,6 +97,7 @@ class AttackSimulator:
         self._cumulative_travel_m: float = 0.0
         self.tick_seconds = float(self.config.get("tick_seconds", 0.1))
         self.last_operation: Optional[Dict[str, Any]] = None
+        self._speed_trigger_met = self.speed_trigger_mps <= 0.0
 
     @staticmethod
     def load_from_path(path: Path, *, tmp_dir: Path) -> "AttackSimulator":
@@ -193,6 +200,15 @@ class AttackSimulator:
             print("[AttackSimulator] Appearing attack requires payload info and pc_range.")
             meta["reason"] = "missing_payload"
             return False, meta
+        if self.speed_trigger_mps > 0.0 and (not self._speed_trigger_met or not self.speed_trigger_once):
+            current_speed = self._estimate_vehicle_speed(payload_info)
+            meta["speed_trigger_mps"] = self.speed_trigger_mps
+            meta["ego_speed_mps"] = current_speed
+            if current_speed is None or current_speed < self.speed_trigger_mps:
+                meta["reason"] = "speed_below_trigger"
+                return False, meta
+            if self.speed_trigger_once:
+                self._speed_trigger_met = True
         anchor_global = self._resolve_anchor_global(payload_info)
         if anchor_global is None:
             meta["reason"] = "anchor_unavailable"
@@ -317,6 +333,23 @@ class AttackSimulator:
                 vel_vec = np.array([vel[0], vel[1], 0.0], dtype=np.float32)
                 travel = abs(float(np.dot(vel_vec, forward)) * float(self.tick_seconds))
         return max(0.0, travel)
+
+    def _estimate_vehicle_speed(self, payload_info: Dict[str, Any]) -> Optional[float]:
+        can_bus = payload_info.get("can_bus")
+        if isinstance(can_bus, (list, tuple, np.ndarray)) and len(can_bus) >= 10:
+            vel = np.asarray(can_bus[7:9], dtype=np.float32)
+            return float(np.linalg.norm(vel))
+        speed = payload_info.get("speed")
+        if speed is not None:
+            try:
+                return float(speed)
+            except (TypeError, ValueError):
+                return None
+        velocity = payload_info.get("velocity") or payload_info.get("ego_velocity")
+        if isinstance(velocity, (list, tuple, np.ndarray)) and len(velocity) >= 2:
+            vel = np.asarray(velocity[:2], dtype=np.float32)
+            return float(np.linalg.norm(vel))
+        return None
 
     def _get_forward_vector(self, payload_info: Dict[str, Any]) -> Optional[np.ndarray]:
         ego_rot = payload_info.get("ego2global_rotation")
